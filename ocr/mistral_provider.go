@@ -9,6 +9,8 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/gabriel-vasile/mimetype"
@@ -18,6 +20,18 @@ import (
 var (
 	mistralOCREndpoint   = "https://api.mistral.ai/v1/ocr"
 	mistralFilesEndpoint = "https://api.mistral.ai/v1/files"
+
+	// mistralRetryBaseDelay is the first wait before an OCR request is retried.
+	mistralRetryBaseDelay = 2 * time.Second
+
+	// mistralImagePlaceholder matches the links Mistral OCR writes for extracted
+	// images, e.g. ![img-0.jpeg](img-0.jpeg). The images themselves are not kept.
+	mistralImagePlaceholder = regexp.MustCompile(`!\[img-\d+\.\w+\]\(img-\d+\.\w+\)`)
+)
+
+const (
+	mistralMaxRetries    = 5
+	mistralMaxRetryDelay = time.Minute
 )
 
 // MistralOCRProvider implements the OCR Provider interface using Mistral's OCR API
@@ -155,7 +169,7 @@ func (p *MistralOCRProvider) ProcessImage(ctx context.Context, data []byte, page
 		}).Debug("Using image URL method")
 	}
 
-	text, err := p.processDocument(req, logger)
+	text, err := p.processDocument(ctx, req, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -343,8 +357,81 @@ func (p *MistralOCRProvider) getSignedURL(fileID string) (string, error) {
 	return signedURLResp.URL, nil
 }
 
+// postOCRRequest posts to the OCR endpoint and returns the last response with
+// its body. A rate limit or a server error is retried, so it does not count
+// against OCR_MAX_RETRIES unless Mistral keeps failing.
+func (p *MistralOCRProvider) postOCRRequest(ctx context.Context, jsonData []byte, logger *logrus.Entry) (*http.Response, []byte, error) {
+	client := &http.Client{Timeout: time.Second * 60} // Increased timeout for OCR processing
+
+	for attempt := 0; ; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", mistralOCREndpoint, bytes.NewReader(jsonData))
+		if err != nil {
+			return nil, nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+		logger.WithFields(logrus.Fields{
+			"url":       mistralOCREndpoint,
+			"method":    "POST",
+			"body_size": len(jsonData),
+			"attempt":   attempt + 1,
+		}).Debug("Sending OCR request")
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			logger.WithError(err).Error("OCR request failed")
+			return nil, nil, err
+		}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			logger.WithError(err).Error("Failed to read OCR response body")
+			return nil, nil, err
+		}
+
+		if !mistralStatusRetryable(resp.StatusCode) || attempt >= mistralMaxRetries {
+			return resp, bodyBytes, nil
+		}
+
+		delay := mistralRetryDelay(resp.Header.Get("Retry-After"), attempt)
+		logger.WithFields(logrus.Fields{
+			"status_code": resp.StatusCode,
+			"attempt":     attempt + 1,
+			"delay":       delay,
+		}).Warn("Mistral OCR request not accepted, retrying")
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+}
+
+func mistralStatusRetryable(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+// mistralRetryDelay doubles per attempt; a longer Retry-After in seconds wins.
+func mistralRetryDelay(retryAfter string, attempt int) time.Duration {
+	delay := mistralRetryBaseDelay << attempt
+	if seconds, err := strconv.Atoi(retryAfter); err == nil && time.Duration(seconds)*time.Second > delay {
+		delay = time.Duration(seconds) * time.Second
+	}
+	if delay > mistralMaxRetryDelay {
+		return mistralMaxRetryDelay
+	}
+	return delay
+}
+
+// stripImagePlaceholders removes image links from a page's markdown, so they
+// do not end up in the document content and its search index.
+func stripImagePlaceholders(markdown string) string {
+	return mistralImagePlaceholder.ReplaceAllString(markdown, "")
+}
+
 // processDocument sends the OCR request to Mistral's API
-func (p *MistralOCRProvider) processDocument(req MistralOCRRequest, logger *logrus.Entry) (string, error) {
+func (p *MistralOCRProvider) processDocument(ctx context.Context, req MistralOCRRequest, logger *logrus.Entry) (string, error) {
 	logger.Debug("Processing document with Mistral OCR API")
 
 	jsonData, err := json.Marshal(req)
@@ -360,33 +447,8 @@ func (p *MistralOCRProvider) processDocument(req MistralOCRRequest, logger *logr
 	reqLogData, _ := json.Marshal(reqCopy)
 	logger.WithField("request_body", string(reqLogData)).Debug("OCR request details")
 
-	httpReq, err := http.NewRequest("POST", mistralOCREndpoint, bytes.NewBuffer(jsonData))
+	resp, bodyBytes, err := p.postOCRRequest(ctx, jsonData, logger)
 	if err != nil {
-		return "", err
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-
-	logger.WithFields(logrus.Fields{
-		"url":         mistralOCREndpoint,
-		"method":      "POST",
-		"body_size":   len(jsonData),
-		"api_key_len": len(p.apiKey),
-	}).Debug("Sending OCR request")
-
-	client := &http.Client{Timeout: time.Second * 60} // Increased timeout for OCR processing
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		logger.WithError(err).Error("OCR request failed")
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Read the full response body for debugging
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.WithError(err).Error("Failed to read OCR response body")
 		return "", err
 	}
 
@@ -430,7 +492,7 @@ func (p *MistralOCRProvider) processDocument(req MistralOCRRequest, logger *logr
 			"page_height":   page.Dimensions.Height,
 		}).Debug("Processing page content")
 
-		combinedText += page.Markdown + "\n"
+		combinedText += stripImagePlaceholders(page.Markdown) + "\n"
 	}
 
 	// Remove trailing newline

@@ -8,9 +8,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
+
+func init() {
+	mistralRetryBaseDelay = time.Millisecond
+}
 
 // testServerState records interactions with the mock Mistral API and lets
 // tests inject failures on individual endpoints (0 = respond normally).
@@ -320,7 +325,7 @@ func TestMistralOCRProvider_ProcessDocument(t *testing.T) {
 	req.Document.DocumentURL = "https://test-document-url"
 
 	logger := log.WithField("test", "process_document")
-	text, err := provider.processDocument(req, logger)
+	text, err := provider.processDocument(context.Background(), req, logger)
 
 	assert.NoError(t, err)
 	assert.Equal(t, "Test OCR output", text)
@@ -483,7 +488,7 @@ func TestMistralOCRProvider_ErrorHandling(t *testing.T) {
 			req.Document.DocumentURL = "https://test-document-url"
 
 			logger := log.WithField("test", "error_handling")
-			text, err := provider.processDocument(req, logger)
+			text, err := provider.processDocument(context.Background(), req, logger)
 
 			if tt.wantErr {
 				assert.Error(t, err)
@@ -497,4 +502,60 @@ func TestMistralOCRProvider_ErrorHandling(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMistralOCRProvider_RetriesRateLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		failures      int
+		status        int
+		wantErr       bool
+		wantCallCount int
+	}{
+		{"rate limit then success", 2, http.StatusTooManyRequests, false, 3},
+		{"server error then success", 1, http.StatusServiceUnavailable, false, 2},
+		{"rate limit never ends", 100, http.StatusTooManyRequests, true, mistralMaxRetries + 1},
+		{"bad request is not retried", 100, http.StatusBadRequest, true, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if calls <= tt.failures {
+					http.Error(w, `{"error": "injected failure"}`, tt.status)
+					return
+				}
+				handleOCRRequest(w, r)
+			}))
+			defer server.Close()
+			orig := mistralOCREndpoint
+			mistralOCREndpoint = server.URL + "/v1/ocr"
+			defer func() { mistralOCREndpoint = orig }()
+
+			provider := &MistralOCRProvider{apiKey: "test-key", model: "test-model"}
+			var req MistralOCRRequest
+			req.Model = "test-model"
+			req.Document.Type = "image_url"
+			req.Document.ImageURL = "data:image/png;base64,AA=="
+			_, err := provider.processDocument(context.Background(), req, log.WithField("test", tt.name))
+			assert.Equal(t, tt.wantErr, err != nil)
+			assert.Equal(t, tt.wantCallCount, calls)
+		})
+	}
+}
+
+func TestMistralRetryDelay(t *testing.T) {
+	orig := mistralRetryBaseDelay
+	mistralRetryBaseDelay = 2 * time.Second
+	defer func() { mistralRetryBaseDelay = orig }()
+
+	assert.Equal(t, 2*time.Second, mistralRetryDelay("", 0))
+	assert.Equal(t, 8*time.Second, mistralRetryDelay("", 2))
+	assert.Equal(t, 30*time.Second, mistralRetryDelay("30", 0))
+	assert.Equal(t, mistralMaxRetryDelay, mistralRetryDelay("3600", 0))
+}
+
+func TestStripImagePlaceholders(t *testing.T) {
+	assert.Equal(t, "Rechnung  Nr. 1", stripImagePlaceholders("Rechnung ![img-0.jpeg](img-0.jpeg) Nr. 1"))
+	assert.Equal(t, "![Logo](logo.png)", stripImagePlaceholders("![Logo](logo.png)"))
 }

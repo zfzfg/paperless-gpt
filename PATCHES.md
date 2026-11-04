@@ -13,5 +13,9 @@ Basis: `1d07ced` (v0.31.0 plus 3 Commits)
 | [#1206](https://github.com/icereed/paperless-gpt/pull/1206) | `a77af08` | Auto-OCR behält Tag-Änderungen aus Paperless |
 | [#1208](https://github.com/icereed/paperless-gpt/pull/1208) | `2975df4` | Tag- und Workflow-Lauf behält Tag-Änderungen, baut auf #1206 auf |
 
+## Eigene Änderungen
+- `ocr/mistral_provider.go`: OCR-Anfragen werden bei HTTP 429 und 5xx bis zu 5-mal wiederholt, `Retry-After` wird beachtet.
+- `ocr/mistral_provider.go`: Bild-Platzhalter wie `![img-0.jpeg](img-0.jpeg)` werden aus dem OCR-Text entfernt.
+
 ## Pflege
 Upstream nach `main` holen und `nas` neu aufbauen. Einen PR aus der Liste nehmen, sobald er upstream gemergt ist. Images entstehen über Tags der Form `v0.31.0-nas.N`.
