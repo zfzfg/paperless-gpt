@@ -10,9 +10,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"text/template"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tmc/langchaingo/llms"
 )
 
 // fakePaperless is a stateful stand-in for paperless-ngx holding one
@@ -29,8 +31,11 @@ type fakePaperless struct {
 	bulk    []map[string]any // bulk_edit bodies
 	ops     []string         // "PATCH" / "bulk_edit", in order
 
-	patchStatus int // when non-zero, PATCH answers with this status
-	bulkStatus  int // when non-zero, bulk_edit answers with this status
+	patchStatus int    // when non-zero, PATCH answers with this status
+	patchBody   string // the body of that answer (default: an unparseable error)
+	tagsStatus  int    // when non-zero, a PATCH with a tag list answers with this status
+	bulkStatus  int    // when non-zero, bulk_edit answers with this status
+	bulkOKCalls int    // with bulkStatus: this many bulk_edit calls succeed first
 
 	parent map[int]int // tag hierarchy: child ID -> parent ID
 }
@@ -131,8 +136,16 @@ func (f *fakePaperless) register(env *testEnv) {
 			}
 			f.patches = append(f.patches, body)
 			f.ops = append(f.ops, "PATCH")
+			if _, hasTags := body["tags"]; hasTags && f.tagsStatus != 0 {
+				http.Error(w, `{"detail":"rejected"}`, f.tagsStatus)
+				return
+			}
 			if f.patchStatus != 0 {
-				http.Error(w, `{"detail":"rejected"}`, f.patchStatus)
+				body := f.patchBody
+				if body == "" {
+					body = `{"detail":"rejected"}`
+				}
+				http.Error(w, body, f.patchStatus)
 				return
 			}
 			if tags, ok := body["tags"].([]any); ok {
@@ -169,7 +182,7 @@ func (f *fakePaperless) register(env *testEnv) {
 		}
 		f.bulk = append(f.bulk, rawMap)
 		f.ops = append(f.ops, "bulk_edit")
-		if f.bulkStatus != 0 {
+		if f.bulkStatus != 0 && len(f.bulk) > f.bulkOKCalls {
 			http.Error(w, "bulk edit failed", f.bulkStatus)
 			return
 		}
@@ -496,6 +509,18 @@ func TestUpdateDocuments_TagsAsDelta(t *testing.T) {
 		assert.Equal(t, `["inbox"]`, mods[0].NewValue, "history shows the tags the document really ended up with")
 	})
 
+	t.Run("removing the returned trigger again falls back to the tag list too", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.teardown()
+		fake := newDeltaTestFake(env)
+		fake.parent = map[int]int{30: 26}
+		fake.bulkStatus, fake.bulkOKCalls = http.StatusInternalServerError, 1
+
+		require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{deltaSuggestion("old text")}, newOCRRunTestDB(t), false))
+		assert.Equal(t, []string{"bulk_edit", "bulk_edit", "PATCH"}, fake.ops)
+		assert.NotContains(t, fake.docTagNames(), "paperless-gpt-ocr-auto")
+	})
+
 	t.Run("nothing to add or remove: no request at all", func(t *testing.T) {
 		env := newTestEnv(t)
 		defer env.teardown()
@@ -508,16 +533,34 @@ func TestUpdateDocuments_TagsAsDelta(t *testing.T) {
 		assert.Empty(t, fake.ops)
 	})
 
-	t.Run("modify_tags failure is returned after the fields were written", func(t *testing.T) {
+	t.Run("rejected modify_tags falls back to the tag list", func(t *testing.T) {
 		env := newTestEnv(t)
 		defer env.teardown()
 		fake := newDeltaTestFake(env)
 		fake.bulkStatus = http.StatusInternalServerError
+		fake.docTags = append(fake.docTags, 77) // invisible tag
+		db := newOCRRunTestDB(t)
+
+		require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{deltaSuggestion("new text")}, db, false))
+		assert.Equal(t, []string{"PATCH", "bulk_edit", "PATCH"}, fake.ops)
+		assert.Equal(t, "new text", fake.content)
+		assert.Equal(t, []string{"", "inbox", "paperless-gpt-ocr-complete"}, fake.docTagNames())
+		mods, err := GetAllModifications(db)
+		require.NoError(t, err)
+		require.Len(t, mods, 2)
+	})
+
+	t.Run("tag change failure is returned after the fields were written", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.teardown()
+		fake := newDeltaTestFake(env)
+		fake.bulkStatus = http.StatusInternalServerError
+		fake.tagsStatus = http.StatusInternalServerError
 		db := newOCRRunTestDB(t)
 
 		err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{deltaSuggestion("new text")}, db, false)
 		require.Error(t, err)
-		assert.Equal(t, []string{"PATCH", "bulk_edit"}, fake.ops)
+		assert.Equal(t, []string{"PATCH", "bulk_edit", "PATCH"}, fake.ops)
 		assert.Equal(t, "new text", fake.content)
 		assert.Equal(t, []string{"inbox", "paperless-gpt-ocr-auto"}, fake.docTagNames(), "the trigger tag stays when the tag change failed")
 
@@ -570,4 +613,397 @@ func TestAutoOcrTagWritesUseTagDelta(t *testing.T) {
 		require.Len(t, client.calls, 1)
 		assert.True(t, client.calls[0].TagsAsDelta)
 	})
+}
+
+// hookLLM is a mockLLM that runs during() once, on the first LLM call, to
+// simulate something else changing the document in paperless-ngx while
+// suggestions are generated.
+type hookLLM struct {
+	mockLLM
+	once   sync.Once
+	during func()
+}
+
+func (m *hookLLM) GenerateContent(ctx context.Context, messages []llms.MessageContent, options ...llms.CallOption) (*llms.ContentResponse, error) {
+	if m.during != nil {
+		m.once.Do(m.during)
+	}
+	return m.mockLLM.GenerateContent(ctx, messages, options...)
+}
+
+// TestProcessTagDocuments_KeepsTagChangesMadeDuringGeneration is the
+// regression test for the auto-tag and workflow loop reverting tags: the
+// suggestion's tag list is built from the document as it was fetched before
+// the LLM ran, and used to be written back as the document's full tag list,
+// undoing every tag change made in paperless-ngx in the meantime.
+func TestProcessTagDocuments_KeepsTagChangesMadeDuringGeneration(t *testing.T) {
+	prevAutoTag, prevManualTag, prevAutoOcrTag, prevFailTag := autoTag, manualTag, autoOcrTag, failTag
+	prevTagTmpl, prevTitleTmpl := tagTemplate, titleTemplate
+	prevGenTitle, prevGenTags, prevGenCorr, prevGenDate, prevGenType := autoGenerateTitle, autoGenerateTags, autoGenerateCorrespondents, autoGenerateCreatedDate, autoGenerateDocumentType
+	t.Cleanup(func() {
+		autoTag, manualTag, autoOcrTag, failTag = prevAutoTag, prevManualTag, prevAutoOcrTag, prevFailTag
+		tagTemplate, titleTemplate = prevTagTmpl, prevTitleTmpl
+		autoGenerateTitle, autoGenerateTags, autoGenerateCorrespondents, autoGenerateCreatedDate, autoGenerateDocumentType = prevGenTitle, prevGenTags, prevGenCorr, prevGenDate, prevGenType
+	})
+	autoTag, manualTag, autoOcrTag, failTag = "paperless-gpt-auto", "paperless-gpt", "paperless-gpt-ocr-auto", ""
+	tagTemplate = template.Must(template.New("tag").Parse("{{.Content}}"))
+	titleTemplate = template.Must(template.New("title").Parse("{{.Content}}"))
+	autoGenerateTitle, autoGenerateTags = "true", "true"
+	autoGenerateCorrespondents, autoGenerateCreatedDate, autoGenerateDocumentType = "false", "false", "false"
+
+	const trigger, done = "invoices-in", "invoices-done"
+	on, off := true, false
+	workflow := WorkflowConfig{
+		ID: "invoices", Name: "Invoices", TriggerTag: trigger, CompletionTag: done,
+		GenerateTitles: &on, GenerateTags: &on, GenerateCorrespondents: &off,
+		GenerateCreatedDate: &off, GenerateDocumentTypes: &off, GenerateCustomFields: &off,
+	}
+
+	newFake := func(env *testEnv, triggerTag string) *fakePaperless {
+		fake := &fakePaperless{
+			tags: map[string]int{
+				"inbox":                      19,
+				triggerTag:                   26,
+				done:                         30,
+				"paperless-gpt-ocr-complete": 31,
+				"finance":                    45,
+				"tax":                        12,
+				"invoice":                    50,
+				manualTag:                    60,
+			},
+			docID: 4797,
+			// 77 is a tag the API user cannot see (not in the catalog).
+			docTags: []int{19, 26, 77, 12},
+			content: "old text",
+		}
+		fake.register(env)
+		return fake
+	}
+	// Both changes happen while the LLM generates the suggestions.
+	changeTags := func(fake *fakePaperless) func() {
+		return func() {
+			fake.addTag("finance")
+			fake.removeTag("tax")
+		}
+	}
+
+	t.Run("AUTO_TAG", func(t *testing.T) {
+		isolateWorkflowSettings(t)
+		env := newTestEnv(t)
+		defer env.teardown()
+		fake := newFake(env, autoTag)
+		app := &App{Client: env.client, Database: env.db, autoTagComplete: done}
+		app.LLM = &hookLLM{mockLLM: mockLLM{Response: "invoice"}, during: changeTags(fake)}
+
+		count, err := app.processAutoTagDocuments(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+		assert.Equal(t, []string{"", "finance", "inbox", "invoice", done}, fake.docTagNames(),
+			"tag changes made while suggestions were generated must survive")
+	})
+
+	t.Run("workflow", func(t *testing.T) {
+		isolateWorkflowSettings(t)
+		useWorkflows(t, workflow)
+		env := newTestEnv(t)
+		defer env.teardown()
+		fake := newFake(env, trigger)
+		app := &App{Client: env.client, Database: env.db}
+		app.LLM = &hookLLM{mockLLM: mockLLM{Response: "invoice"}, during: changeTags(fake)}
+
+		count, err := app.processAutoTagDocuments(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+		assert.Equal(t, []string{"", "finance", "inbox", "invoice", done}, fake.docTagNames())
+
+		// The history row starts from the tags the document had when the
+		// change was applied, so undoing it does not revert the concurrent
+		// changes either.
+		mods, err := GetAllModifications(env.db)
+		require.NoError(t, err)
+		var tagMod *ModificationHistory
+		for i := range mods {
+			if mods[i].ModField == "tags" {
+				tagMod = &mods[i]
+			}
+		}
+		require.NotNil(t, tagMod)
+		assert.Contains(t, tagMod.PreviousValue, `"finance"`)
+		assert.NotContains(t, tagMod.PreviousValue, `"tax"`)
+		assert.Contains(t, tagMod.NewValue, `"invoice"`)
+		assert.NotContains(t, tagMod.NewValue, trigger)
+	})
+
+	t.Run("workflow with OCR", func(t *testing.T) {
+		isolateWorkflowSettings(t)
+		wf := workflow
+		wf.EnableOCR = &on
+		useWorkflows(t, wf)
+		env := newTestEnv(t)
+		defer env.teardown()
+		fake := newFake(env, trigger)
+		app := &App{
+			Client:            env.client,
+			Database:          env.db,
+			ocrProvider:       &mockOCRProvider{},
+			pdfOCRTagging:     true,
+			pdfOCRCompleteTag: "paperless-gpt-ocr-complete",
+			// One change while OCR runs, one while the LLM runs.
+			docProcessor: &hookDocumentProcessor{text: "OCR text", during: func(int) { fake.addTag("finance") }},
+		}
+		app.LLM = &hookLLM{mockLLM: mockLLM{Response: "invoice"}, during: func() { fake.removeTag("tax") }}
+
+		count, err := app.processAutoTagDocuments(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+		assert.Equal(t, []string{"", "finance", "inbox", "invoice", done, "paperless-gpt-ocr-complete"}, fake.docTagNames())
+		assert.Equal(t, "OCR text", fake.content)
+	})
+
+	t.Run("workflow waiting for approval", func(t *testing.T) {
+		isolateWorkflowSettings(t)
+		wf := workflow
+		wf.RequireApproval = true
+		useWorkflows(t, wf)
+		env := newTestEnv(t)
+		defer env.teardown()
+		require.NoError(t, env.db.AutoMigrate(&PendingReview{}))
+		fake := newFake(env, trigger)
+		app := &App{Client: env.client, Database: env.db}
+		app.LLM = &hookLLM{mockLLM: mockLLM{Response: "invoice"}, during: changeTags(fake)}
+
+		count, err := app.processAutoTagDocuments(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+		assert.Equal(t, []string{"", "finance", "inbox", manualTag}, fake.docTagNames(),
+			"moving the document to the review queue must not revert tag changes either")
+
+		// Approving applies the held suggestion the way the review UI does:
+		// rebuilt against the current document and written as a tag list.
+		var record PendingReview
+		require.NoError(t, env.db.First(&record, fake.docID).Error)
+		current, err := env.client.GetDocument(context.Background(), fake.docID)
+		require.NoError(t, err)
+		held, err := pendingSuggestion(record, current)
+		require.NoError(t, err)
+		require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{held}, env.db, false))
+		assert.Equal(t, []string{"", "finance", "inbox", "invoice", done}, fake.docTagNames(),
+			"approving must not bring back a tag removed while the suggestions were generated")
+	})
+
+	// If paperless-ngx rejects modify_tags, the tag change degrades to a
+	// tag list written from a fresh read instead of being lost.
+	t.Run("modify_tags rejected", func(t *testing.T) {
+		for _, approval := range []bool{false, true} {
+			t.Run("approval="+strconv.FormatBool(approval), func(t *testing.T) {
+				isolateWorkflowSettings(t)
+				wf := workflow
+				wf.RequireApproval = approval
+				useWorkflows(t, wf)
+				env := newTestEnv(t)
+				defer env.teardown()
+				require.NoError(t, env.db.AutoMigrate(&PendingReview{}))
+				fake := newFake(env, trigger)
+				fake.bulkStatus = http.StatusMethodNotAllowed
+				app := &App{Client: env.client, Database: env.db}
+				app.LLM = &hookLLM{mockLLM: mockLLM{Response: "invoice"}, during: changeTags(fake)}
+
+				count, err := app.processAutoTagDocuments(context.Background())
+				require.NoError(t, err)
+				assert.Equal(t, 1, count)
+				want := []string{"", "finance", "inbox", "invoice", done}
+				if approval {
+					want = []string{"", "finance", "inbox", manualTag}
+					var n int64
+					env.db.Model(&PendingReview{}).Count(&n)
+					assert.EqualValues(t, 1, n, "the held suggestions are kept")
+				}
+				assert.Equal(t, want, fake.docTagNames())
+			})
+		}
+	})
+}
+
+func TestTagChangeAsDelta(t *testing.T) {
+	prevComplete, prevFail, prevAutoComplete := pdfOCRCompleteTag, failTag, autoTagComplete
+	t.Cleanup(func() { pdfOCRCompleteTag, failTag, autoTagComplete = prevComplete, prevFail, prevAutoComplete })
+	pdfOCRCompleteTag, failTag, autoTagComplete = "ocr-done", "failed", ""
+	isolateWorkflowSettings(t)
+
+	snapshot := Document{ID: 1, Tags: []string{"inbox", "Tax", "trigger", "ocr-done", "other-trigger"}}
+	tests := []struct {
+		name                       string
+		in                         DocumentSuggestion
+		wantSuggested, wantRemoved []string
+	}{
+		{
+			name: "replace: new tags are added, dropped tags removed, marker tags kept",
+			in: DocumentSuggestion{
+				SuggestedTags: []string{"inbox", "tax", "invoice"},
+				RemoveTags:    []string{"trigger"},
+				AddTags:       []string{"done"},
+			},
+			wantSuggested: []string{"invoice"},
+			wantRemoved:   []string{"trigger", "other-trigger"},
+		},
+		{
+			name: "keep original tags: only adds",
+			in: DocumentSuggestion{
+				SuggestedTags:    []string{"inbox", "invoice"},
+				KeepOriginalTags: true,
+				RemoveTags:       []string{"trigger"},
+			},
+			wantSuggested: []string{"invoice"},
+			wantRemoved:   []string{"trigger"},
+		},
+		{
+			name: "tag generation off: the snapshot's tags change nothing",
+			in: DocumentSuggestion{
+				SuggestedTags: slices.Clone(snapshot.Tags),
+				RemoveTags:    []string{"trigger"},
+			},
+			wantRemoved: []string{"trigger"},
+		},
+		{
+			name:        "no suggested tags",
+			in:          DocumentSuggestion{RemoveTags: []string{"TRIGGER"}},
+			wantRemoved: []string{"TRIGGER"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.in.ID, tt.in.OriginalDocument = 1, snapshot
+			got := tagChangeAsDelta(tt.in)
+			assert.True(t, got.TagsAsDelta)
+			assert.Equal(t, tt.wantSuggested, got.SuggestedTags)
+			assert.Equal(t, tt.wantRemoved, got.RemoveTags)
+			assert.Equal(t, tt.in.AddTags, got.AddTags)
+			assert.Equal(t, tt.in.KeepOriginalTags, got.KeepOriginalTags)
+		})
+	}
+
+	t.Run("an existing delta is left alone", func(t *testing.T) {
+		in := DocumentSuggestion{ID: 1, OriginalDocument: snapshot, SuggestedTags: []string{"inbox"}, TagsAsDelta: true}
+		assert.Equal(t, in, tagChangeAsDelta(in))
+	})
+}
+
+// Without concurrent changes, the converted suggestion leaves the document
+// with the tags the full-list write gives.
+func TestTagChangeAsDelta_SameResultAsTagList(t *testing.T) {
+	prevCreate, prevComplete := createNewTags, pdfOCRCompleteTag
+	t.Cleanup(func() { createNewTags, pdfOCRCompleteTag = prevCreate, prevComplete })
+	createNewTags, pdfOCRCompleteTag = false, "paperless-gpt-ocr-complete"
+	isolateWorkflowSettings(t)
+
+	suggestions := map[string]DocumentSuggestion{
+		"replace": {
+			SuggestedTags: []string{"inbox", "finance"},
+			RemoveTags:    []string{"paperless-gpt-ocr-auto"},
+			AddTags:       []string{"done"},
+		},
+		"replace drops a tag": {
+			SuggestedTags: []string{"finance"},
+			RemoveTags:    []string{"paperless-gpt-ocr-auto"},
+		},
+		"keep original tags": {
+			SuggestedTags:    []string{"finance"},
+			KeepOriginalTags: true,
+			RemoveTags:       []string{"paperless-gpt-ocr-auto"},
+		},
+		"completion tag equals trigger": {
+			SuggestedTags: []string{"inbox"},
+			RemoveTags:    []string{"paperless-gpt-ocr-auto"},
+			AddTags:       []string{"paperless-gpt-ocr-auto"},
+		},
+	}
+	for name, suggestion := range suggestions {
+		t.Run(name, func(t *testing.T) {
+			final := func(s DocumentSuggestion, asDelta bool) []string {
+				env := newTestEnv(t)
+				defer env.teardown()
+				fake := newDeltaTestFake(env)
+				fake.tags["done"] = 50
+				fake.tags[pdfOCRCompleteTag] = 30
+				fake.docTags = append(fake.docTags, 30, 77) // marker tag, invisible tag
+				doc, err := env.client.GetDocument(context.Background(), 7)
+				require.NoError(t, err)
+				s.ID, s.OriginalDocument, s.SuggestedTitle = 7, doc, "New title"
+				if asDelta {
+					s = tagChangeAsDelta(s)
+				}
+				require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{s}, newOCRRunTestDB(t), false))
+				return fake.docTagNames()
+			}
+			assert.Equal(t, final(suggestion, false), final(suggestion, true))
+		})
+	}
+}
+
+// When paperless-ngx rejects every field of a delta suggestion, the tag
+// change still lands and the dropped fields are reported, like the tag list
+// did when it was part of the PATCH.
+func TestUpdateDocuments_TagsAsDeltaWhenEveryFieldIsRejected(t *testing.T) {
+	prevCreate := createNewTags
+	t.Cleanup(func() { createNewTags = prevCreate })
+	createNewTags = false
+
+	t.Run("tag change applied, partial update reported", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.teardown()
+		fake := newDeltaTestFake(env)
+		fake.patchStatus, fake.patchBody = http.StatusBadRequest, `{"content":["invalid"]}`
+
+		err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{deltaSuggestion("new text")}, newOCRRunTestDB(t), false)
+		var partial *PartialUpdateError
+		require.ErrorAs(t, err, &partial)
+		assert.Equal(t, []string{"content"}, partial.DroppedFields)
+		assert.Equal(t, []string{"inbox", "paperless-gpt-ocr-complete"}, fake.docTagNames())
+		assert.Equal(t, "old text", fake.content)
+	})
+
+	t.Run("no tag change: still an error", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.teardown()
+		fake := newDeltaTestFake(env)
+		fake.patchStatus, fake.patchBody = http.StatusBadRequest, `{"content":["invalid"]}`
+		suggestion := deltaSuggestion("new text")
+		suggestion.RemoveTags, suggestion.AddTags = nil, nil
+
+		err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{suggestion}, newOCRRunTestDB(t), false)
+		require.Error(t, err)
+		assert.NotErrorAs(t, err, new(*PartialUpdateError))
+		assert.Empty(t, fake.bulk)
+	})
+
+	t.Run("tag change fails: error, not a partial success", func(t *testing.T) {
+		env := newTestEnv(t)
+		defer env.teardown()
+		fake := newDeltaTestFake(env)
+		fake.patchStatus, fake.patchBody = http.StatusBadRequest, `{"content":["invalid"]}`
+		fake.bulkStatus = http.StatusInternalServerError
+
+		err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{deltaSuggestion("new text")}, newOCRRunTestDB(t), false)
+		require.Error(t, err)
+		assert.NotErrorAs(t, err, new(*PartialUpdateError))
+	})
+}
+
+// Taking a document out of the queue must not depend on modify_tags alone,
+// or a rejected bulk_edit would leave it to be processed on every poll.
+func TestMarkProcessingFailed_FallsBackToTagListWhenModifyTagsFails(t *testing.T) {
+	prevFailTag := failTag
+	t.Cleanup(func() { failTag = prevFailTag })
+	failTag = "finance" // any existing tag
+
+	env := newTestEnv(t)
+	defer env.teardown()
+	fake := newDeltaTestFake(env)
+	fake.bulkStatus = http.StatusInternalServerError
+	doc, err := env.client.GetDocument(context.Background(), 7)
+	require.NoError(t, err)
+
+	require.NoError(t, markProcessingFailed(context.Background(), env.client, newOCRRunTestDB(t), doc, "paperless-gpt-ocr-auto", "update failed"))
+	assert.Equal(t, []string{"bulk_edit", "PATCH"}, fake.ops)
+	assert.Equal(t, []string{"finance", "inbox"}, fake.docTagNames())
 }
