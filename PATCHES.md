@@ -1,6 +1,6 @@
 # Patches des Forks
 
-Der Branch `main` spiegelt `icereed/paperless-gpt`. Der Branch `nas` ist `main` plus diese offenen Upstream-PRs, in dieser Reihenfolge gemergt.
+Der Branch `main` dieses Forks ist `icereed/paperless-gpt` plus diese offenen Upstream-PRs, in dieser Reihenfolge gemergt, und die eigenen Änderungen unten.
 
 Basis: `1d07ced` (v0.31.0 plus 3 Commits)
 
@@ -18,4 +18,4 @@ Basis: `1d07ced` (v0.31.0 plus 3 Commits)
 - `ocr/mistral_provider.go`: Bild-Platzhalter wie `![img-0.jpeg](img-0.jpeg)` werden aus dem OCR-Text entfernt.
 
 ## Pflege
-Upstream nach `main` holen und `nas` neu aufbauen. Einen PR aus der Liste nehmen, sobald er upstream gemergt ist. Images entstehen über Tags der Form `v0.31.0-nas.N`.
+Upstream regelmäßig in `main` mergen. Einen PR aus der Liste nehmen, sobald er upstream gemergt ist. Images entstehen über Tags der Form `v0.31.0-nas.N`.
