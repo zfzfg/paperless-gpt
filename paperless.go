@@ -438,6 +438,7 @@ func (client *PaperlessClient) GetDocumentsByTag(ctx context.Context, tag string
 			Tags:          tagNames,
 			TagIDs:        result.Tags,
 			CreatedDate:   result.CreatedDate,
+			Added:         result.Added,
 		})
 	}
 
@@ -577,6 +578,7 @@ func (client *PaperlessClient) GetDocument(ctx context.Context, documentID int) 
 		Tags:             tagNames,
 		TagIDs:           documentResponse.Tags,
 		CreatedDate:      documentResponse.CreatedDate,
+		Added:            documentResponse.Added,
 		OriginalFileName: documentResponse.OriginalFileName,
 		CustomFields:     documentResponse.CustomFields,
 		DocumentTypeName: documentTypeName,
@@ -697,7 +699,7 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		originalDoc := document.OriginalDocument
 		updatedFields := make(map[string]interface{})
 		originalFields := make(map[string]interface{})
-		var partialDroppedFields []string
+		partialDroppedFields := slices.Clone(document.UnusableFields)
 
 		// isHandoverTag reports whether a tag marks the document as waiting for
 		// paperless-gpt and has to come off once it is processed: the global

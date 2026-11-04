@@ -51,11 +51,46 @@ type BackgroundProcessor interface {
 	isOcrEnabled() bool
 }
 
+// maxBackgroundBackoff bounds the wait after a failed cycle. It used to be an
+// hour, which looks like a hung loop long after the provider has recovered.
+const maxBackgroundBackoff = 5 * time.Minute
+
+// runBackgroundCycle runs one poll over both queues. A failure in the OCR queue
+// must not keep the auto-tag queue from running.
+func runBackgroundCycle(ctx context.Context, app BackgroundProcessor) (int, error) {
+	count := 0
+	var errs []error
+	if app.isOcrEnabled() {
+		ocrCount, err := app.processAutoOcrTagDocuments(ctx)
+		count += ocrCount
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error in processAutoOcrTagDocuments: %w", err))
+		}
+	}
+	autoCount, err := app.processAutoTagDocuments(ctx)
+	count += autoCount
+	if err != nil {
+		errs = append(errs, fmt.Errorf("error in processAutoTagDocuments: %w", err))
+	}
+	return count, errors.Join(errs...)
+}
+
+// waitOrDone waits for d and reports whether the context is still active.
+func waitOrDone(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // Start our background tasks in a goroutine
 func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 	go func() {
 		minBackoffDuration := 10 * time.Second
-		maxBackoffDuration := time.Hour
 		pollingInterval := 10 * time.Second
 
 		backoffDuration := minBackoffDuration
@@ -68,46 +103,26 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 			default: // needed to make this non-blocking
 			}
 
-			processedCount, err := func() (count int, err error) {
-				count = 0
-
-				// If OCR is enabled, run OCR tagging first
-				if app.isOcrEnabled() {
-					ocrCount, err := app.processAutoOcrTagDocuments(ctx)
-					if err != nil {
-						return 0, fmt.Errorf("error in processAutoOcrTagDocuments: %w", err)
-					}
-					count += ocrCount
-				}
-
-				// Run auto-tagging after OCR
-				autoCount, err := app.processAutoTagDocuments(ctx)
-				if err != nil {
-					return 0, fmt.Errorf("error in processAutoTagDocuments: %w", err)
-				}
-				count += autoCount
-
-				return count, nil
-			}()
+			processedCount, err := runBackgroundCycle(ctx, app)
 
 			if err != nil {
 				log.Errorf("Error in background tagging: %v", err)
-				time.Sleep(backoffDuration)
-
-				// Exponential backoff logic
-				backoffDuration *= 2
-				if backoffDuration > maxBackoffDuration {
-					log.Warnf("Max backoff duration reached. Using %v", maxBackoffDuration)
-					backoffDuration = maxBackoffDuration
+				if !waitOrDone(ctx, backoffDuration) {
+					continue
 				}
+			}
+			if err != nil && processedCount == 0 {
+				// Exponential backoff logic
+				backoffDuration = min(backoffDuration*2, maxBackgroundBackoff)
 			} else {
-				// Reset backoff when processing succeeds
+				// A cycle that got documents through is no outage, even if one
+				// document failed: that one has its own retry limit.
 				backoffDuration = minBackoffDuration
 			}
 
 			// If nothing was processed, pause before next cycle
 			if processedCount == 0 {
-				time.Sleep(pollingInterval)
+				waitOrDone(ctx, pollingInterval)
 			}
 		}
 	}()
@@ -318,7 +333,7 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 			// document waits until it can.
 			if autoTagMaxRetries > 0 && ctx.Err() == nil && !isUnreachable(err) {
 				attempts := app.suggestionFailures.recordFailure(document.ID)
-				if attempts >= autoTagMaxRetries {
+				if attempts >= retryLimitFor(autoTagMaxRetries, err) {
 					reason := fmt.Sprintf("suggestion generation failed %d times", attempts)
 					if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, reason); recErr != nil {
 						// Keep the failure count so the tag removal is retried
@@ -457,7 +472,7 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		// provider doesn't count against the document.
 		if ocrMaxRetries > 0 && ctx.Err() == nil && !isUnreachable(err) {
 			attempts := app.ocrFailures.recordFailure(document.ID)
-			if attempts >= ocrMaxRetries {
+			if attempts >= retryLimitFor(ocrMaxRetries, err) {
 				reason := fmt.Sprintf("OCR failed %d times", attempts)
 				if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, reason); recErr != nil {
 					docLogger.Errorf("Removing %q tag after repeated OCR failures also failed: %v", triggerTag, recErr)
@@ -641,7 +656,7 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 			// either, and doesn't count.
 			if ocrMaxRetries > 0 && ctx.Err() == nil && !isUnreachable(err) {
 				attempts := app.ocrFailures.recordFailure(document.ID)
-				if attempts >= ocrMaxRetries {
+				if attempts >= retryLimitFor(ocrMaxRetries, err) {
 					reason := fmt.Sprintf("OCR failed %d times", attempts)
 					if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, autoOcrTag, reason); recErr != nil {
 						// Keep the failure count so the tag removal is

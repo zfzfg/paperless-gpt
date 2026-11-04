@@ -1,6 +1,8 @@
 I will provide you with the content of a document. Your task is to find the date when the document was created.
 Respond only with the date in YYYY-MM-DD format, without any additional information.
-If no day was found, use the first day of the month. If no month was found, use January. If no date was found at all, answer with today's date.
+Use the date the document itself states as its own date, such as its issue, letter or invoice date. Never use a due date, a service period or the date of a future event.
+If the document does not state a complete date with day, month and year, answer exactly: unknown
+Never guess a missing day or month, and never answer with today's date just because no date was found.
 The content is likely in {{.Language}}. Today's date is {{.Today}}.
 
 The data will be provided using an XML-like format for clarity:

@@ -10,6 +10,9 @@ var previousDefaultPrompts = map[string][]string{
 	"correspondent_prompt.tmpl": {
 		"4257eafb65354c82d62a7d4d37453e234172f3a908e6df1bd97aebff964ffc63",
 	},
+	"created_date_prompt.tmpl": {
+		"2217d0e95ece5ecf2f107bbf1b7bc436a53c0803e419b6ecf3a4eac2169e40cd",
+	},
 	"custom_field_prompt.tmpl": {
 		"391979d2b0518e495ccc77ae2ac2bc7d02ea22c9902b2acdcd807964230b3875",
 		"cad2ed737a0ba79c6519f1e870b2c862c9a108f28f81ca41d6ca5e12ab33603a",

@@ -30,7 +30,7 @@ type GetDocumentApiResponseResult struct {
 	// Created             time.Time     `json:"created"`
 	CreatedDate string `json:"created_date"`
 	// Modified            time.Time     `json:"modified"`
-	// Added               time.Time     `json:"added"`
+	Added string `json:"added"`
 	// ArchiveSerialNumber interface{}   `json:"archive_serial_number"`
 	// OriginalFileName    string        `json:"original_file_name"`
 	// ArchivedFileName    string        `json:"archived_file_name"`
@@ -69,6 +69,7 @@ type GetDocumentApiResponse struct {
 	Content          string                `json:"content"`
 	Tags             []int                 `json:"tags"`
 	CreatedDate      string                `json:"created_date"`
+	Added            string                `json:"added,omitempty"`
 	OriginalFileName string                `json:"original_file_name"`
 	Notes            []interface{}         `json:"notes"`
 	CustomFields     []CustomFieldResponse `json:"custom_fields"`
@@ -90,6 +91,7 @@ type Document struct {
 	TagIDs           []int                 `json:"tag_ids,omitempty"`
 	Correspondent    string                `json:"correspondent"`
 	CreatedDate      string                `json:"created_date"`
+	Added            string                `json:"added,omitempty"`
 	OriginalFileName string                `json:"original_file_name"`
 	DocumentTypeName string                `json:"document_type_name"`
 	CustomFields     []CustomFieldResponse `json:"custom_fields"`
@@ -191,6 +193,10 @@ type DocumentSuggestion struct {
 	AddTags                []string                `json:"add_tags,omitempty"`
 	CustomFieldsWriteMode  string                  `json:"custom_fields_write_mode,omitempty"`
 	CustomFieldsEnable     bool                    `json:"custom_fields_enable"`
+
+	// UnusableFields names fields the LLM answered for without a usable value.
+	// The rest of the suggestion is applied and the document gets the fail tag.
+	UnusableFields []string `json:"-"`
 	// TagsAsDelta applies the tag change as an add/remove on the server
 	// (paperless-ngx bulk_edit modify_tags) instead of writing back a full tag
 	// list computed from OriginalDocument. Use it when OriginalDocument may be

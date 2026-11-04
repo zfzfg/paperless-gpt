@@ -80,7 +80,7 @@ func (r *RateLimitedLLM) Call(ctx context.Context, prompt string, options ...llm
 		}
 
 		// Check if we should retry
-		if attempt >= r.maxRetries {
+		if isPermanentProviderError(err) || attempt >= r.maxRetries {
 			if lastErr != nil {
 				return "", fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
 			}
@@ -196,7 +196,7 @@ func (r *RateLimitedLLM) GenerateContent(ctx context.Context, messages []llms.Me
 		}
 
 		// Check if we should retry
-		if attempt >= r.maxRetries {
+		if isPermanentProviderError(err) || attempt >= r.maxRetries {
 			if lastErr != nil {
 				return nil, fmt.Errorf("all retry attempts failed, last error: %w", lastErr)
 			}

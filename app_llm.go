@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"paperless-gpt/internal/textsanitize"
 	"slices"
@@ -415,6 +416,38 @@ func (app *App) getSuggestedCreatedDate(ctx context.Context, content string, log
 	return normalizeCreatedDate(result), nil
 }
 
+// plausibleCreatedDate returns the suggested date if it can be the document's
+// date, and "" otherwise, which leaves the date in paperless-ngx untouched.
+// Results are written without review, so a date is dropped when:
+//   - it is not a calendar date, such as the prompt's "unknown"
+//   - it lies after the day the document was added (#1089). One day of leeway
+//     covers "added" being UTC while the document carries a local date.
+//   - it is today and the document has another date: that is a model filling
+//     a gap rather than reading a date, and it would overwrite the old one.
+func plausibleCreatedDate(suggested string, doc Document, now time.Time, logger *logrus.Entry) string {
+	if suggested == "" {
+		return ""
+	}
+	date, err := time.Parse("2006-01-02", suggested)
+	if err != nil {
+		logger.Infof("No usable created date in LLM reply %q, keeping %q", truncateForLog(suggested, 40), doc.CreatedDate)
+		return ""
+	}
+	latest := now
+	if added, err := time.Parse(time.RFC3339, doc.Added); err == nil {
+		latest = added
+	}
+	if date.After(latest.AddDate(0, 0, 1)) {
+		logger.Warnf("Created date %s lies after the document was added (%s), keeping %q", suggested, latest.Format("2006-01-02"), doc.CreatedDate)
+		return ""
+	}
+	if suggested == now.Format("2006-01-02") && doc.CreatedDate != "" && doc.CreatedDate != suggested {
+		logger.Warnf("Created date %s is today and the document has %q, keeping it", suggested, doc.CreatedDate)
+		return ""
+	}
+	return suggested
+}
+
 var xmlAttrEscaper = strings.NewReplacer(
 	"&", "&amp;",
 	`"`, "&quot;",
@@ -460,6 +493,11 @@ const (
 	// alone needs; see plausibleDocumentReference.
 	minDocumentLinkDigits = 5
 )
+
+// errUnusableCustomFieldResponse means the LLM answered, but not with anything
+// the custom fields can be read from. Generating the suggestion again would
+// bill all prompts of the document, so the rest is kept and the document marked.
+var errUnusableCustomFieldResponse = errors.New("custom field response is not usable")
 
 // getSuggestedCustomFields generates suggested custom fields for a document using the LLM.
 // tmplOverride, when non-nil, replaces the global customFieldTemplate for this call.
@@ -563,7 +601,7 @@ func (app *App) getSuggestedCustomFields(ctx context.Context, doc Document, sele
 		// object, or a map of known field names used to be discarded with
 		// no log above debug, and the document was then marked processed.
 		logger.Warnf("Custom field response is not usable JSON, skipping custom fields. Starts with: %s", truncateForLog(response, 80))
-		return []CustomFieldSuggestion{}, nil
+		return nil, errUnusableCustomFieldResponse
 	}
 
 	// Map field names back to fields. Only the fields sent in the prompt are
@@ -591,6 +629,11 @@ func (app *App) getSuggestedCustomFields(ctx context.Context, doc Document, sele
 			continue
 		}
 		value := llmField.Value
+		if text, isString := value.(string); value == nil || (isString && strings.TrimSpace(text) == "") {
+			// "Nothing found" must not clear or block a value already there.
+			logger.Debugf("LLM returned no value for custom field '%s', skipping.", field.Name)
+			continue
+		}
 		if field.DataType == documentLinkFieldType {
 			linkedIDs := app.resolveDocumentLinks(ctx, doc.ID, value, logger)
 			if len(linkedIDs) == 0 {
@@ -835,8 +878,10 @@ func (app *App) generateSingleDocumentSuggestion(ctx context.Context, suggestion
 			log.Errorf("Error generating createdDate for document %d: %v", documentID, err)
 			return DocumentSuggestion{}, fmt.Errorf("Document %d: %w", documentID, err)
 		}
+		suggestedCreatedDate = plausibleCreatedDate(suggestedCreatedDate, doc, time.Now(), docLogger)
 	}
 
+	var unusableFields []string
 	if suggestionRequest.GenerateCustomFields {
 		selectedIDs := customFieldIDsFor(suggestionRequest.Workflow)
 
@@ -844,7 +889,9 @@ func (app *App) generateSingleDocumentSuggestion(ctx context.Context, suggestion
 			log.Warnf("Custom field generation is enabled, but no custom fields are selected (in Settings, or in the AI workflow). Please select at least one custom field for this feature to work.")
 		} else {
 			suggestedCustomFields, err = app.getSuggestedCustomFields(ctx, doc, selectedIDs, docLogger, wfTemplate("custom_field_prompt", customFieldTemplate))
-			if err != nil {
+			if errors.Is(err, errUnusableCustomFieldResponse) {
+				unusableFields = append(unusableFields, "custom_fields (unusable LLM response)")
+			} else if err != nil {
 				log.Errorf("Error generating custom fields for document %d: %v", documentID, err)
 				return DocumentSuggestion{}, fmt.Errorf("Document %d: %w", documentID, err)
 			}
@@ -854,6 +901,7 @@ func (app *App) generateSingleDocumentSuggestion(ctx context.Context, suggestion
 	suggestion := DocumentSuggestion{
 		ID:               documentID,
 		OriginalDocument: doc,
+		UnusableFields:   unusableFields,
 	}
 	settingsMutex.RLock()
 	suggestion.CustomFieldsWriteMode = settings.CustomFieldsWriteMode
@@ -1045,21 +1093,21 @@ func parseCustomFieldLLMResponse(response string, knownNames []string) (fields [
 			}
 		}
 		var out []llmCustomFieldResponse
+		anyKnown := false
 		for _, name := range knownNames {
 			raw, has := rawMessageByKey(obj, name)
 			if !has {
 				continue
 			}
+			anyKnown = true
 			var val interface{}
 			if err := json.Unmarshal(raw, &val); err != nil || val == nil {
 				continue
 			}
 			out = append(out, llmCustomFieldResponse{Field: name, Value: val})
 		}
-		if len(out) == 0 {
-			return nil, false
-		}
-		return out, true
+		// All known fields null is a clear "nothing found".
+		return out, anyKnown
 	default:
 		return nil, false
 	}
@@ -1099,7 +1147,29 @@ func cleanLLMJSON(content string) string {
 		"\u200b", "",
 		"\ufeff", "",
 	).Replace(content)
-	return stripMarkdown(content)
+	return extractJSON(stripMarkdown(content))
+}
+
+// extractJSON finds the JSON value in a reply that wraps it in prose, such as
+// "Here are the fields:" followed by a fenced block. Text that doesn't contain
+// a complete JSON array or object is returned unchanged.
+func extractJSON(content string) string {
+	if content == "" || content[0] == '[' || content[0] == '{' {
+		return content
+	}
+	start := strings.IndexAny(content, "[{")
+	if start < 0 {
+		return content
+	}
+	closer := byte(']')
+	if content[start] == '{' {
+		closer = '}'
+	}
+	end := strings.LastIndexByte(content, closer)
+	if end <= start || !json.Valid([]byte(content[start:end+1])) {
+		return content
+	}
+	return content[start : end+1]
 }
 
 // truncateForLog shortens a model reply so a warning can quote it without

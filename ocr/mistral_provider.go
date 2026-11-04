@@ -34,6 +34,20 @@ const (
 	mistralMaxRetryDelay = time.Minute
 )
 
+// HTTPStatusError is a provider answering with an error status. It keeps the
+// status readable through error wrapping, so the retry limits can tell a
+// provider outage from a document that cannot be processed.
+type HTTPStatusError struct {
+	Message    string
+	StatusCode int
+	After      time.Duration
+}
+
+func (e *HTTPStatusError) Error() string { return e.Message }
+
+// RetryAfter returns the cooldown the provider asked for, if any.
+func (e *HTTPStatusError) RetryAfter() time.Duration { return e.After }
+
 // MistralOCRProvider implements the OCR Provider interface using Mistral's OCR API
 type MistralOCRProvider struct {
 	apiKey       string
@@ -466,7 +480,10 @@ func (p *MistralOCRProvider) processDocument(ctx context.Context, req MistralOCR
 			"response_body": string(bodyBytes),
 			"headers":       resp.Header,
 		}).Error("OCR request failed with detailed error info")
-		return "", fmt.Errorf("OCR request failed with status: %d, response: %s", resp.StatusCode, string(bodyBytes))
+		return "", &HTTPStatusError{
+			Message:    fmt.Sprintf("OCR request failed with status: %d, response: %s", resp.StatusCode, string(bodyBytes)),
+			StatusCode: resp.StatusCode,
+		}
 	}
 
 	var ocrResp MistralOCRResponse

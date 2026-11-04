@@ -28,7 +28,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/anthropic"
-	"github.com/tmc/langchaingo/llms/mistral"
 	"github.com/tmc/langchaingo/llms/ollama"
 	"github.com/tmc/langchaingo/llms/openai"
 	"gorm.io/gorm"
@@ -1290,16 +1289,8 @@ func createLLM() (llms.Model, error) {
 		if mistralApiKey == "" {
 			return nil, fmt.Errorf("Mistral API key is not set")
 		}
-		llm, err := mistral.New(
-			mistral.WithModel(llmModel),
-			mistral.WithAPIKey(mistralApiKey),
-		)
-		if err != nil {
-			return nil, err
-		}
-
 		// Apply rate limiting with isVision=false
-		return NewRateLimitedLLM(llm, getRateLimitConfig(false)), nil
+		return NewRateLimitedLLM(newMistralChatLLM(mistralApiKey, llmModel), getRateLimitConfig(false)), nil
 	case "openai":
 		if openaiAPIKey == "" {
 			return nil, fmt.Errorf("OpenAI API key is not set")

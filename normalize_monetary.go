@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -48,9 +49,14 @@ func normalizeMonetary(value string) string {
 // normalizeCustomFieldValue applies type-aware normalization to a single
 // custom-field value. Monetary strings become the paperless-ngx amount
 // form, and date strings that are a year-first calendar date become
-// YYYY-MM-DD. Everything else (numbers, bools, other types, nil, and a
-// date that cannot be read confidently) passes through unchanged.
+// YYYY-MM-DD. A bare number for a text field becomes a string, because
+// paperless-ngx measures the length of a string field's value and cannot do
+// that for a number. Everything else (bools, other types, nil, and a date
+// that cannot be read confidently) passes through unchanged.
 func normalizeCustomFieldValue(dataType string, value interface{}) interface{} {
+	if number, ok := value.(float64); ok && (dataType == "string" || dataType == "longtext") {
+		return strconv.FormatFloat(number, 'f', -1, 64)
+	}
 	s, ok := value.(string)
 	if !ok {
 		return value
