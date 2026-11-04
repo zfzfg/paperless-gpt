@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -50,6 +51,10 @@ const (
 	// Page texts are kept for this many most-recent runs per document so the
 	// Playground can compare runs without the database growing unbounded.
 	ocrRunsWithPagesPerDocument = 5
+
+	// ocrReuseWindow bounds how old a run's pages may be to save a new OCR call.
+	// A document tagged again later on purpose gets a fresh OCR.
+	ocrReuseWindow = 24 * time.Hour
 	// Hard cap on stored run records (small rows; pruned oldest-first).
 	maxOCRRunRecords = 1000
 )
@@ -173,6 +178,62 @@ func PruneOCRRuns(db *gorm.DB, documentID int) error {
 
 // LatestOCRRunJobID returns the job id of the newest run of a document that
 // has stored page results, or "" if none exist.
+func latestEarlierOCRRun(db *gorm.DB, documentID int, currentJobID string) (OCRRun, bool) {
+	var runs []OCRRun
+	err := db.Where("document_id = ? AND job_id <> ? AND started_at > ?", documentID, currentJobID, time.Now().Add(-ocrReuseWindow)).
+		Order("started_at DESC, id DESC").Limit(1).Find(&runs).Error
+	if err != nil || len(runs) == 0 {
+		return OCRRun{}, false
+	}
+	return runs[0], true
+}
+
+// resumableOCRPages returns the page texts of the document's previous run if
+// that run failed, by page index. A retry then only pays for the missing pages.
+// Reused pages are saved under the new run, so they survive a further failure
+// and the pruning of old runs.
+func resumableOCRPages(db *gorm.DB, documentID int, currentJobID, processMode string) map[int]string {
+	if db == nil {
+		return nil
+	}
+	run, found := latestEarlierOCRRun(db, documentID, currentJobID)
+	if !found || run.Status != "failed" || run.ProcessMode != processMode {
+		return nil
+	}
+	results, err := GetOcrPageResults(db, documentID, run.JobID)
+	if err != nil {
+		return nil
+	}
+	pages := make(map[int]string, len(results))
+	for _, result := range results {
+		pages[result.PageIndex] = result.Text
+	}
+	return pages
+}
+
+// ocrAlreadyWritten reports whether the document's content is exactly what its
+// last run produced. The trigger tag stays on until the metadata is written, so
+// without this a metadata failure pays for OCR of the whole document again on
+// every poll.
+func ocrAlreadyWritten(db *gorm.DB, documentID int, content string) bool {
+	if db == nil || content == "" {
+		return false
+	}
+	run, found := latestEarlierOCRRun(db, documentID, "")
+	if !found || run.Status != "completed" {
+		return false
+	}
+	results, err := GetOcrPageResults(db, documentID, run.JobID)
+	if err != nil || len(results) == 0 {
+		return false
+	}
+	texts := make([]string, 0, len(results))
+	for _, result := range results {
+		texts = append(texts, result.Text)
+	}
+	return strings.Join(texts, "\n\n") == content
+}
+
 func LatestOCRRunJobID(db *gorm.DB, documentID int) string {
 	var jobID string
 	db.Model(&OCRPageResult{}).

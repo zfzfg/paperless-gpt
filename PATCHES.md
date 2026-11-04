@@ -21,6 +21,7 @@ Basis: `1d07ced` (v0.31.0 plus 3 Commits)
 - `background.go`, `unreachable.go`: Wartezeit nach Fehlern höchstens 5 Minuten und abbrechbar, ein OCR-Fehler stoppt den Tag-Lauf nicht mehr. HTTP 401, 402, 403, 429 und 5xx gelten mit Grenze 48 statt 3 als Störung des Anbieters.
 - `llm_client.go`: Dauerhafte 4xx-Fehler werden nicht wiederholt.
 - `app_llm.go`, `paperless.go`, `normalize_monetary.go`: JSON in Fließtext wird erkannt. Eine unbrauchbare Custom-Field-Antwort setzt das Fehler-Tag, die übrigen Felder bleiben. Leere Werte werden übersprungen, Zahlen für Textfelder zu Text umgewandelt.
+- `ocr.go`, `ocr_runs.go`, `background.go`: Automatische Läufe verwenden 24 Stunden lang die Seiten eines fehlgeschlagenen Laufs wieder und überspringen OCR, wenn sein Text bereits im Dokument steht.
 
 ## Pflege
 Upstream regelmäßig in `main` mergen. Einen PR aus der Liste nehmen, sobald er upstream gemergt ist. Images entstehen über Tags der Form `v0.31.0-nas.N`.

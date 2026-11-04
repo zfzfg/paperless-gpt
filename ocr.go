@@ -368,6 +368,11 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			routes = app.planPageRouting(ctx, documentID, len(imagePaths), totalPdfPages, docLogger)
 		}
 
+		var resumedPages map[int]string
+		if options.ResumeFailedRun && !options.UploadPDF && !app.createLocalHOCR && !app.createLocalPDF && !hasHOCR {
+			resumedPages = resumableOCRPages(app.Database, documentID, jobID, processMode)
+		}
+
 		for i, imagePath := range imagePaths {
 			select {
 			case <-ctx.Done():
@@ -392,7 +397,10 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			imageDataList = append(imageDataList, imageContent)
 
 			var result *ocr.OCRResult
-			if i < len(routes) && routes[i].UseTextLayer {
+			if text, resumed := resumedPages[i]; resumed {
+				pageLogger.Info("Reusing the page from the failed previous run")
+				result = &ocr.OCRResult{Text: text, Metadata: map[string]string{"provider": "resumed"}}
+			} else if i < len(routes) && routes[i].UseTextLayer {
 				pageLogger.Infof("Using the page's own text layer instead of OCR (%s)", routes[i].Reason)
 				result = &ocr.OCRResult{
 					Text:     routes[i].Text,

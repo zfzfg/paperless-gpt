@@ -250,6 +250,7 @@ type OCROptions struct {
 	ProcessMode     string // OCR processing mode: "image" (default) or "pdf"
 	ExistingContent string // Existing document text (e.g., from Tesseract) to include in OCR prompt
 	PromptOverride  string // Run-scoped OCR prompt template; empty = use the saved template
+	ResumeFailedRun bool   // Reuse the pages of a failed previous run instead of paying for them again
 }
 
 // PartialUpdateError signals that a document update succeeded only after

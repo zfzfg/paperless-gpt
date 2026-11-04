@@ -418,8 +418,14 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		}
 	}
 
+	if ocrAlreadyWritten(app.Database, document.ID, document.Content) {
+		docLogger.Info("Document already carries the text of its last OCR run, skipping workflow OCR")
+		return &document, nil
+	}
+
 	options := app.effectiveOCROptionsForWorkflow(wf)
 	options.ExistingContent = document.Content
+	options.ResumeFailedRun = true
 
 	jobID := generateJobID()
 	jobStore.addJob(&Job{
@@ -595,6 +601,7 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 
 		options := app.effectiveOCRDefaults()
 		options.ExistingContent = document.Content
+		options.ResumeFailedRun = true
 
 		// Every auto run is tracked exactly like a manual one: registered in
 		// the in-memory job store (live progress) and persisted as an OCR Run
