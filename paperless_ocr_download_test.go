@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"image"
+	"image/color"
+	"image/gif"
 	_ "image/jpeg"
 	"net/http"
 	"os"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/image/tiff"
 )
 
 // onePixelPNG is a minimal 1x1 PNG used to simulate a non-PDF original served
@@ -152,4 +156,93 @@ func TestDownloadDocumentAsPDF_NonPDFUnsupported(t *testing.T) {
 	_, _, _, err := env.client.DownloadDocumentAsPDF(context.Background(), documentID, 0, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a PDF")
+}
+
+func onePixelTIFF(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, tiff.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 1, 1)), nil))
+	return buf.Bytes()
+}
+
+// extraTIFFIFD points the first directory at a copy of itself, so the file
+// has two pages. imaging.Decode would still return only the first.
+func extraTIFFIFD(t *testing.T, single []byte) []byte {
+	t.Helper()
+	require.GreaterOrEqual(t, len(single), 8)
+	var order binary.ByteOrder = binary.LittleEndian
+	if string(single[0:2]) == "MM" {
+		order = binary.BigEndian
+	}
+	off := int(order.Uint32(single[4:8]))
+	entries := int(order.Uint16(single[off : off+2]))
+	nextAt := off + 2 + entries*12
+	require.LessOrEqual(t, nextAt+4, len(single))
+
+	out := append([]byte{}, single...)
+	extraAt := len(out)
+	ifd := append([]byte{}, single[off:nextAt+4]...)
+	order.PutUint32(ifd[len(ifd)-4:], 0)
+	order.PutUint32(out[nextAt:nextAt+4], uint32(extraAt))
+	return append(out, ifd...)
+}
+
+func twoFrameGIF(t *testing.T) []byte {
+	t.Helper()
+	pal := color.Palette{color.Black, color.White}
+	frame := func() *image.Paletted { return image.NewPaletted(image.Rect(0, 0, 1, 1), pal) }
+	var buf bytes.Buffer
+	require.NoError(t, gif.EncodeAll(&buf, &gif.GIF{
+		Image: []*image.Paletted{frame(), frame()},
+		Delay: []int{0, 0},
+	}))
+	return buf.Bytes()
+}
+
+func TestMultiPageImagesAreRefused(t *testing.T) {
+	n, err := countClassicTIFFIFDs(onePixelTIFF(t))
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	multi := extraTIFFIFD(t, onePixelTIFF(t))
+	n, err = countClassicTIFFIFDs(multi)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+
+	_, err = countClassicTIFFIFDs([]byte{'M', 'M', 0x00, 43, 0, 0, 0, 8})
+	assert.Error(t, err, "BigTIFF has no reliable page count here")
+
+	env := newTestEnv(t)
+	defer env.teardown()
+	env.client.CacheFolder = t.TempDir()
+
+	serve := func(id int, payload []byte) {
+		env.setMockResponse(fmt.Sprintf("/api/documents/%d/download/", id), func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+		})
+	}
+
+	serve(980, multi)
+	_, _, err = env.client.DownloadDocumentAsImages(context.Background(), 980, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "multi-page TIFF")
+
+	_, _, _, err = env.client.DownloadDocumentAsPDF(context.Background(), 980, 0, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "multi-page TIFF")
+
+	serve(981, twoFrameGIF(t))
+	_, _, err = env.client.DownloadDocumentAsImages(context.Background(), 981, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "multi-frame GIF")
+
+	serve(982, onePixelTIFF(t))
+	paths, pages, err := env.client.DownloadDocumentAsImages(context.Background(), 982, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 1, pages)
+	require.Len(t, paths, 1)
+	content, err := os.ReadFile(paths[0])
+	require.NoError(t, err)
+	assertJPEGOfSize(t, content, 1, 1)
 }

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
+	"image/gif"
 	"image/jpeg"
 	"io"
 	"math"
@@ -1754,7 +1756,99 @@ func writeOriginalImageAsPage(documentID int, docDir string, data []byte) (strin
 // image decoders understand, with EXIF orientation applied), caps it to the
 // IMAGE_MAX_* limits and re-encodes it as JPEG. See writeOriginalImageAsPage
 // for why this is always JPEG.
+// maxImageDirectories caps the TIFF IFD walk. A looping offset must not spin.
+const maxImageDirectories = 10000
+
+// refuseMultiPageImage fails when an image has more than one page or frame,
+// or when the page count cannot be known. imaging.Decode and the standard
+// TIFF decoder return only the first page, which would drop the rest without
+// a trace. A single-page TIFF or a single-frame GIF is left for the JPEG
+// re-encode. Animated WebP is not detected here.
+func refuseMultiPageImage(data []byte) error {
+	if isGIFData(data) {
+		frames, err := gif.DecodeAll(bytes.NewReader(data))
+		if err != nil {
+			return fmt.Errorf("GIF could not be read, refusing it so no frame is dropped: %w", err)
+		}
+		if len(frames.Image) != 1 {
+			return fmt.Errorf("multi-frame GIF has %d frames and cannot be processed without dropping frames", len(frames.Image))
+		}
+		return nil
+	}
+	if isTIFFData(data) {
+		n, err := countClassicTIFFIFDs(data)
+		if err != nil {
+			return fmt.Errorf("TIFF page count is unknown (%v) and cannot be processed without dropping pages", err)
+		}
+		if n != 1 {
+			return fmt.Errorf("multi-page TIFF has %d pages and cannot be processed without dropping pages", n)
+		}
+	}
+	return nil
+}
+
+func isGIFData(data []byte) bool {
+	return bytes.HasPrefix(data, []byte("GIF87a")) || bytes.HasPrefix(data, []byte("GIF89a"))
+}
+
+func isTIFFData(data []byte) bool {
+	return bytes.HasPrefix(data, []byte("II")) || bytes.HasPrefix(data, []byte("MM"))
+}
+
+// countClassicTIFFIFDs counts directories of a classic TIFF (magic 42).
+// BigTIFF (magic 43), a loop, or an offset that runs off the file is an error.
+func countClassicTIFFIFDs(data []byte) (int, error) {
+	if len(data) < 8 {
+		return 0, fmt.Errorf("TIFF header is too short")
+	}
+	var order binary.ByteOrder
+	switch string(data[0:2]) {
+	case "II":
+		order = binary.LittleEndian
+	case "MM":
+		order = binary.BigEndian
+	default:
+		return 0, fmt.Errorf("not a TIFF")
+	}
+	magic := order.Uint16(data[2:4])
+	if magic == 43 {
+		return 0, fmt.Errorf("BigTIFF is not supported")
+	}
+	if magic != 42 {
+		return 0, fmt.Errorf("unexpected TIFF magic %d", magic)
+	}
+	offset := int(order.Uint32(data[4:8]))
+	seen := map[int]struct{}{}
+	count := 0
+	for offset != 0 {
+		if count >= maxImageDirectories {
+			return 0, fmt.Errorf("more than %d IFDs", maxImageDirectories)
+		}
+		if _, ok := seen[offset]; ok {
+			return 0, fmt.Errorf("IFD loop at offset %d", offset)
+		}
+		seen[offset] = struct{}{}
+		if offset < 0 || offset+2 > len(data) {
+			return 0, fmt.Errorf("IFD offset %d is outside the file", offset)
+		}
+		entries := int(order.Uint16(data[offset : offset+2]))
+		nextAt := offset + 2 + entries*12
+		if entries < 0 || nextAt < offset || nextAt+4 > len(data) {
+			return 0, fmt.Errorf("IFD at offset %d runs outside the file", offset)
+		}
+		count++
+		offset = int(order.Uint32(data[nextAt : nextAt+4]))
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("TIFF has no IFD")
+	}
+	return count, nil
+}
+
 func normalizeOriginalImage(documentID int, data []byte) ([]byte, error) {
+	if err := refuseMultiPageImage(data); err != nil {
+		return nil, fmt.Errorf("document %d: %w", documentID, err)
+	}
 	img, err := imaging.Decode(bytes.NewReader(data), imaging.AutoOrientation(true))
 	if err != nil {
 		return nil, fmt.Errorf("document %d: decoding original image: %w", documentID, err)
