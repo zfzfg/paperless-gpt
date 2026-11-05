@@ -692,7 +692,7 @@ func TestDownloadDocumentAsImages(t *testing.T) {
 	// Verify that exatly one page was extracted
 	assert.Len(t, imagePaths, 1)
 	// The path shall end with paperless-gpt/document-123/page000.jpg
-	assert.Contains(t, imagePaths[0], "paperless-gpt/document-123/page000.jpg")
+	assert.Contains(t, filepath.ToSlash(imagePaths[0]), "paperless-gpt/document-123/page000.jpg")
 	for _, imagePath := range imagePaths {
 		_, err := os.Stat(imagePath)
 		assert.NoError(t, err)
@@ -735,7 +735,7 @@ func TestDownloadDocumentAsImages_ManyPages(t *testing.T) {
 	for _, imagePath := range imagePaths {
 		_, err := os.Stat(imagePath)
 		assert.NoError(t, err)
-		assert.Contains(t, imagePath, "tests/tmp/document-321/page")
+		assert.Contains(t, filepath.ToSlash(imagePath), "tests/tmp/document-321/page")
 	}
 
 	// Verify total pages count

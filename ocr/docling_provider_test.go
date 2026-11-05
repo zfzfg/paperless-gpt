@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -184,7 +185,14 @@ func TestDoclingProvider_ProcessImage(t *testing.T) {
 
 			if tt.expectedErrStr != "" {
 				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.expectedErrStr)
+				// Windows reports a refused dial as "actively refused", Linux as
+				// "connection refused". Both mean the server was not there.
+				if tt.expectedErrStr == "connection refused" {
+					msg := strings.ToLower(err.Error())
+					assert.True(t, strings.Contains(msg, "connection refused") || strings.Contains(msg, "actively refused"), err.Error())
+				} else {
+					assert.Contains(t, err.Error(), tt.expectedErrStr)
+				}
 				assert.Nil(t, result)
 			} else {
 				assert.NoError(t, err)

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,7 +29,23 @@ func TestParseMountPoints(t *testing.T) {
 	assert.False(t, mounts["/app/db"], "a tmpfs mount is empty after a restart and does not count")
 }
 
+func TestOnMountStopsWhenDirStopsShrinking(t *testing.T) {
+	done := make(chan bool, 1)
+	go func() {
+		done <- onMount(`C:\app\db`, map[string]bool{})
+	}()
+	select {
+	case got := <-done:
+		assert.False(t, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("onMount did not return")
+	}
+}
+
 func TestPersistenceIssues(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sample mountinfo uses slash paths; filepath.Join on Windows does not match them")
+	}
 	mounts := parseMountPoints(strings.NewReader(sampleMountinfo))
 
 	issues := persistenceIssues("/app", mounts)
@@ -46,6 +64,9 @@ func TestPersistenceIssues(t *testing.T) {
 }
 
 func TestPersistenceIssuesFlagsLegacyPromptsMount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sample mountinfo uses slash paths; filepath.Join on Windows does not match them")
+	}
 	mounts := map[string]bool{"/": true, "/app/config": true, "/app/db": true, "/root/prompts": true}
 	issues := persistenceIssues("/app", mounts)
 

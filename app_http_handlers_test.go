@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -381,6 +382,9 @@ func TestWorkflowHandlersEnsureTagsExist(t *testing.T) {
 func TestWorkflowHandlersKeepStateOnFailedSave(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod does not remove the owner's write permission on Windows")
 	}
 	router := setupTestRouter(t)
 	isolateWorkflowSettings(t)

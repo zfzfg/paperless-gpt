@@ -86,10 +86,19 @@ func persistenceIssues(cwd string, mounts map[string]bool) []PersistenceIssue {
 // onMount reports whether path, or a directory above it other than "/", is
 // a mount point.
 func onMount(path string, mounts map[string]bool) bool {
-	for p := filepath.Clean(path); p != "/" && p != "."; p = filepath.Dir(p) {
+	// "/" (and a Windows volume root, whose Dir is itself) does not count:
+	// that is the container's own file system. Stop when Dir stops shrinking,
+	// otherwise a Windows path walks up to "C:\" and stays there.
+	p := filepath.Clean(path)
+	for p != "/" && p != "." && p != `\` {
 		if mounts[p] {
 			return true
 		}
+		next := filepath.Dir(p)
+		if next == p {
+			return false
+		}
+		p = next
 	}
 	return false
 }
