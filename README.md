@@ -2,11 +2,11 @@
 
 Hi! This is my personal fork of [paperless-gpt](https://github.com/icereed/paperless-gpt), the excellent project by [icereed](https://github.com/icereed) that brings LLMs and OCR to [paperless-ngx](https://github.com/paperless-ngx/paperless-ngx).
 
-There is no grand plan here and this is not a replacement for upstream. It is the upstream project plus a handful of fixes I wanted before trusting it with my own documents. **If you are looking for paperless-gpt in general, please use [upstream](https://github.com/icereed/paperless-gpt).** That is also where you will find the full documentation.
+There is no grand plan here and this is not a replacement for upstream. It is the upstream project plus the fixes I wanted before trusting it with my own documents. **If you are looking for paperless-gpt in general, please use [upstream](https://github.com/icereed/paperless-gpt).** That is also where you will find the full documentation.
 
 ## Credit where it is due
 
-This fork is almost entirely made of other people's work. Nearly every change here is an open pull request that someone else wrote and submitted upstream. I only picked them and merged them together, while they did the actual thinking, debugging and testing. If one of these fixes helps you, please thank them and leave a note on their pull request.
+This fork builds on other people's work. Six of its fixes are open pull requests that someone else wrote and submitted upstream. For those, I only picked them and merged them together, while the authors did the actual thinking, debugging and testing. If one of these fixes helps you, please thank them and leave a note on their pull request.
 
 ## Why this fork exists
 
@@ -29,21 +29,47 @@ Based on upstream `main` at `1d07ced` (v0.31.0 plus three commits).
 | [#1206](https://github.com/icereed/paperless-gpt/pull/1206) | [pipamann](https://github.com/pipamann) | Auto OCR keeps tag changes made while it runs | My own tag edits should not be reverted |
 | [#1208](https://github.com/icereed/paperless-gpt/pull/1208) | [pipamann](https://github.com/pipamann) | The same protection for the auto-tag and workflow loop | This is the path my documents actually take |
 
-### Two small changes of my own
+### Changes of my own
 
-Both are in `ocr/mistral_provider.go` and have unit tests:
+All of these have unit tests.
+
+**Mistral OCR**
 
 - **Retries for Mistral OCR.** Requests that get HTTP 429 or a 5xx response are retried up to five times, respecting `Retry-After`. A rate limit should not earn a document the failure tag while working through an archive.
 - **No image placeholders in the text.** Mistral OCR writes links such as `![img-0.jpeg](img-0.jpeg)` into its output. They are removed, so they stay out of the document content and search.
+- **No paying twice for OCR.** Automatic runs reuse the pages of a failed previous run, and skip OCR when the document already carries the text of its last run. Both apply for 24 hours. Before this, an outage sent finished pages to the provider again on every retry: in a test with five pages, a metadata outage over three polls caused 15 page requests instead of 5.
 
-The list of merged commits is in [PATCHES.md](PATCHES.md).
+**Metadata from Mistral**
+
+- **A direct chat client for `LLM_PROVIDER: mistral`.** The client from langchaingo fails when a model returns `content` as an array of chunks, which reasoning models may do. A reply that is empty or cut off now counts as an error instead of leaving the document looking finished. It also no longer forces temperature 1 and `max_tokens` 4000 onto requests, so the model's own defaults apply.
+
+**Created date**
+
+- **No guessing.** The default prompt used to ask for today's date when it found none, and for the first of the month or January when parts were missing. It now answers `unknown`, which leaves the existing date alone.
+- **Impossible dates are dropped.** That covers a date after the document was added ([#1089](https://github.com/icereed/paperless-gpt/issues/1089)), with one day of leeway for time zones, and today's date when the document already has a different one. A date clearly printed in the document still replaces an existing date.
+
+**Outages and retries**
+
+- **Shorter, cancellable waits.** The wait after a failed poll is capped at 5 minutes instead of an hour, and resets once a poll gets documents through. A failure in the OCR queue no longer stops the auto-tag queue in that poll.
+- **An outage is not the document's fault.** HTTP 401, 402, 403, 429 and 5xx get a limit of 48 attempts instead of the normal retry limit, so a provider outage does not put the failure tag on a whole queue within minutes. That is about four hours at the longest wait.
+- **Permanent errors are not resent.** Other 4xx responses to chat requests, such as a 400, fail right away.
+
+**Custom fields**
+
+- **JSON wrapped in prose is understood**, such as a sentence followed by a fenced block.
+- **Unusable replies are visible.** The other fields are still written, and the document gets the failure tag instead of counting as done.
+- **Empty values are skipped**, so "nothing found" cannot clear or block an existing value.
+- **Numbers for text fields become strings.** paperless-ngx answers a bare number in a string field with HTTP 500, which loses the whole update.
+
+The list of merged commits and changes is in [PATCHES.md](PATCHES.md).
 
 ## Current state
 
 To be upfront about what has and has not been tried:
 
 - The Go test suite passes.
-- The mock-LLM end-to-end tests passed against paperless-ngx 3.4.2 on `v0.31.0-nas.1`, before my two Mistral changes were added.
+- The mock-LLM end-to-end tests passed against paperless-ngx 3.4.2 on `v0.31.0-nas.1`, before my own changes were added. They have not been run again since.
+- The new date, retry, chat client and custom field changes have only run against test servers and mocks. The field limits and the HTTP 500 were checked against a throwaway local paperless-ngx.
 - I have **not** run this in production or against the real Mistral API yet.
 
 Think of it as a work in progress for my own setup. There is no support and there are no stability promises, and I may rework or drop this fork at any time. If upstream merges these pull requests, I would happily go back to the original.
