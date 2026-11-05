@@ -1006,6 +1006,50 @@ func TestGetSuggestedTags_SystemTagsNeverSuggested(t *testing.T) {
 	}
 }
 
+func TestTagExcludeListHidesTagsFromModel(t *testing.T) {
+	previous := tagExcludeList
+	previousCreate := createNewTags
+	tagExcludeList = []string{"FreiGegeben", "excel-ok"}
+	createNewTags = false
+	t.Cleanup(func() {
+		tagExcludeList = previous
+		createNewTags = previousCreate
+	})
+
+	prev := tagTemplate
+	tagTemplate = template.Must(template.New("tag").Parse(testTagTemplate))
+	t.Cleanup(func() { tagTemplate = prev })
+
+	llm := &mockLLM{Response: "Invoice, FREIGEGEBEN, excel-ok, brand-new-tag"}
+	app := &App{LLM: llm}
+	suggested, err := app.getSuggestedTags(
+		context.Background(), "Belegtext", "Titel",
+		[]string{"Invoice", "freigegeben", "excel-ok", "metallbau"},
+		[]string{"freigegeben"},
+		logrus.WithField("test", t.Name()), nil,
+	)
+	require.NoError(t, err)
+	assert.NotContains(t, strings.ToLower(llm.lastPrompt), "freigegeben")
+	assert.NotContains(t, strings.ToLower(llm.lastPrompt), "excel-ok")
+	assert.Contains(t, llm.lastPrompt, "Invoice")
+	assert.Contains(t, suggested, "Invoice")
+	assert.Contains(t, suggested, "freigegeben", "an excluded tag already on the document stays")
+	assert.NotContains(t, suggested, "excel-ok", "the model must not put an excluded tag on")
+	assert.NotContains(t, suggested, "brand-new-tag", "CREATE_NEW_TAGS off drops tags that do not exist")
+	assert.NotContains(t, suggested, "FREIGEGEBEN")
+}
+
+func TestHandoverTagsIgnoresExcludeList(t *testing.T) {
+	previous := tagExcludeList
+	tagExcludeList = []string{"freigegeben", "invoices-done"}
+	t.Cleanup(func() { tagExcludeList = previous })
+
+	_, add := handoverTags("freigegeben", true, "paperless-gpt-auto", &WorkflowConfig{
+		CompletionTag: "invoices-done",
+	})
+	assert.Equal(t, []string{"invoices-done"}, add, "a completion tag the program sets is not blocked by TAG_EXCLUDE_LIST")
+}
+
 func TestHandoverTags(t *testing.T) {
 	previousManualTag, previousAutoTag := manualTag, autoTag
 	manualTag, autoTag = "paperless-gpt", "paperless-gpt-auto"

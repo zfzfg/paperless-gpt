@@ -102,13 +102,16 @@ func (app *App) getSuggestedTags(
 		activeTmpl = tmplOverride
 	}
 
-	// Remove all paperless-gpt related tags from available tags
-	availableTags = removeSystemTags(availableTags)
+	// catalog keeps every non-system tag, including TAG_EXCLUDE_LIST. The model
+	// must not see those names, but an excluded tag already on the document
+	// has to survive the membership check below.
+	catalog := removeSystemTags(availableTags)
+	promptTags := withoutExcludedTags(catalog)
 
 	// Get available tokens for content
 	templateData := map[string]interface{}{
 		"Language":      likelyLanguage,
-		"AvailableTags": availableTags,
+		"AvailableTags": promptTags,
 		"OriginalTags":  originalTags,
 		"Title":         suggestedTitle,
 		"CreateNewTags": createNewTags,
@@ -156,13 +159,19 @@ func (app *App) getSuggestedTags(
 
 	response := textsanitize.StripReasoning(completion.Choices[0].Content)
 
-	suggestedTags := strings.Split(response, ",")
-	for i, tag := range suggestedTags {
-		suggestedTags[i] = strings.TrimSpace(tag)
+	// Drop excluded names from the model answer before the document's own
+	// tags are appended. Filtering only the prompt list would also delete an
+	// excluded tag the document already has.
+	var modelTags []string
+	for _, tag := range strings.Split(response, ",") {
+		tag = strings.TrimSpace(tag)
+		if tag == "" || tagExcluded(tag) {
+			continue
+		}
+		modelTags = append(modelTags, tag)
 	}
 
-	// append the original tags to the suggested tags
-	suggestedTags = append(suggestedTags, originalTags...)
+	suggestedTags := append(modelTags, originalTags...)
 	// Remove duplicates
 	slices.Sort(suggestedTags)
 	suggestedTags = slices.Compact(suggestedTags)
@@ -173,9 +182,10 @@ func (app *App) getSuggestedTags(
 		filteredTags := []string{}
 		for _, tag := range suggestedTags {
 			if tag != "" {
-				// Use the available tag's casing if it exists
+				// Use the catalog casing if the tag already exists. catalog,
+				// not the prompt list, so an excluded original tag is kept.
 				matched := false
-				for _, availableTag := range availableTags {
+				for _, availableTag := range catalog {
 					if strings.EqualFold(tag, availableTag) {
 						filteredTags = append(filteredTags, availableTag)
 						matched = true
@@ -196,7 +206,7 @@ func (app *App) getSuggestedTags(
 
 	filteredTags := []string{}
 	for _, tag := range suggestedTags {
-		for _, availableTag := range availableTags {
+		for _, availableTag := range catalog {
 			if strings.EqualFold(tag, availableTag) {
 				filteredTags = append(filteredTags, availableTag)
 				break
