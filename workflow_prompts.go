@@ -121,6 +121,11 @@ func validateWorkflowOCRConfig(app *App, wf WorkflowConfig) error {
 	if app != nil && workflowWantsOCR(wf) && !app.isOcrEnabled() {
 		return fmt.Errorf("enable_ocr needs an OCR provider, but none is configured")
 	}
+	if app != nil && workflowWantsOCR(wf) {
+		if err := app.mistralRefusesProcessMode(app.effectiveOCROptionsForWorkflow(wf).ProcessMode); err != nil {
+			return err
+		}
+	}
 	prompt := ""
 	if wf.Prompts != nil {
 		prompt = strings.TrimSpace(wf.Prompts["ocr_prompt"])

@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"paperless-gpt/ocr"
+
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -305,4 +307,69 @@ func TestEffectiveOCRDefaultsMergesSettingsOverEnv(t *testing.T) {
 
 	opts = app.effectiveOCRDefaults()
 	assert.False(t, opts.ReplaceOriginal)
+}
+
+func TestMistralHTTPRejectsPDFModes(t *testing.T) {
+	t.Chdir(t.TempDir())
+	gin.SetMode(gin.TestMode)
+	db := newOCRRunTestDB(t)
+	app := &App{
+		Client:         &mockPaperlessClient{},
+		Database:       db,
+		ocrProvider:    &ocr.MistralOCRProvider{},
+		ocrProcessMode: "image",
+	}
+
+	settingsMutex.Lock()
+	orig := settings
+	settingsMutex.Unlock()
+	t.Cleanup(func() {
+		settingsMutex.Lock()
+		settings = orig
+		settingsMutex.Unlock()
+	})
+
+	router := gin.New()
+	router.POST("/api/documents/:id/ocr", app.submitOCRJobHandler)
+	router.PUT("/api/ocr/defaults", app.updateOCRDefaultsHandler)
+
+	post := func(body string) *httptest.ResponseRecorder {
+		req, err := http.NewRequest(http.MethodPost, "/api/documents/12/ocr", bytes.NewBufferString(body))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	put := func(body string) *httptest.ResponseRecorder {
+		req, err := http.NewRequest(http.MethodPut, "/api/ocr/defaults", bytes.NewBufferString(body))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	for _, mode := range []string{"pdf", "whole_pdf"} {
+		w := post(`{"process_mode":"` + mode + `"}`)
+		assert.Equal(t, http.StatusBadRequest, w.Code, mode)
+		assert.Contains(t, w.Body.String(), "page images are required")
+
+		w = put(`{"process_mode":"` + mode + `"}`)
+		assert.Equal(t, http.StatusBadRequest, w.Code, "save "+mode)
+	}
+
+	mode := "whole_pdf"
+	settingsMutex.Lock()
+	settings.OCR = OCRDefaults{ProcessMode: &mode}
+	settingsMutex.Unlock()
+	w := post(`{}`)
+	assert.Equal(t, http.StatusBadRequest, w.Code, "a saved whole_pdf default is refused at run time")
+
+	w = post(`{"process_mode":"image"}`)
+	require.Equal(t, http.StatusAccepted, w.Code)
+	select {
+	case <-jobQueue:
+	default:
+	}
 }

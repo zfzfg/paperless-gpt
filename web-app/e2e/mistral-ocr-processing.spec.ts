@@ -91,7 +91,7 @@ test.beforeAll(async () => {
   testEnv = await setupTestEnvironment({
     // Override default configuration for Mistral OCR
     ocrProvider: 'mistral_ocr',
-    processMode: 'whole_pdf'
+    processMode: 'image'
   });
 });
 
@@ -105,7 +105,7 @@ test.beforeEach(async ({ page: testPage }) => {
   await page.screenshot({ path: 'test-results/mistral-ocr-initial-state.png' });
 });
 
-test('should process multi-page PDF with Mistral OCR using whole_pdf mode', async () => {
+test('should process multi-page PDF with Mistral OCR using image mode', async () => {
   // Skip test if MISTRAL_API_KEY is not provided
   if (!process.env.MISTRAL_API_KEY) {
     console.log('Skipping Mistral OCR test - MISTRAL_API_KEY not provided');
@@ -117,7 +117,7 @@ test('should process multi-page PDF with Mistral OCR using whole_pdf mode', asyn
   const credentials = { username: 'admin', password: 'admin' };
   const baseUrl = `http://localhost:${paperlessNgxPort}`;
 
-  console.log('Testing Mistral OCR with multi-page PDF in whole_pdf mode...');
+  console.log('Testing Mistral OCR with multi-page PDF in image mode...');
 
   // 1. Create the OCR auto tag
   console.log('Creating OCR auto tag...');
@@ -270,7 +270,7 @@ test('should process multi-page PDF with Mistral OCR using whole_pdf mode', asyn
   await page.screenshot({ path: 'test-results/mistral-ocr-final-state.png' });
 
   console.log('✅ Mistral OCR E2E test completed successfully!');
-  console.log(`✅ Processed 5-page PDF with whole_pdf mode`);
+  console.log(`✅ Processed 5-page PDF with image mode`);
   console.log(`✅ Extracted ${documentContent?.length} characters of text`);
   console.log(`✅ OCR complete tag added successfully`);
 });

@@ -227,10 +227,10 @@ const testEnv = await setupTestEnvironment({
   processMode: 'image'
 });
 
-// Mistral dedicated OCR
+// Mistral dedicated OCR. pdf and whole_pdf are refused for this provider.
 const testEnv = await setupTestEnvironment({
   ocrProvider: 'mistral_ocr',
-  processMode: 'whole_pdf'
+  processMode: 'image'
 });
 ```
 

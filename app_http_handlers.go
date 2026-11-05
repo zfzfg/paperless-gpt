@@ -388,6 +388,10 @@ func (app *App) submitOCRJobHandler(c *gin.Context) {
 		}
 		options.ProcessMode = mode
 	}
+	if err := app.mistralRefusesProcessMode(options.ProcessMode); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if req.UploadPDF != nil {
 		options.UploadPDF = *req.UploadPDF
 	}
@@ -547,6 +551,10 @@ func (app *App) updateOCRDefaultsHandler(c *gin.Context) {
 		mode := *defaults.ProcessMode
 		if mode != "image" && mode != "pdf" && mode != "whole_pdf" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "process_mode must be one of: image, pdf, whole_pdf"})
+			return
+		}
+		if err := app.mistralRefusesProcessMode(mode); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 	}

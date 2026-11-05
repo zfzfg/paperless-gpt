@@ -35,6 +35,8 @@ type PDFChoice = "none" | "attach" | "replace";
 const pdfChoiceOf = (options: OCRRunOptions): PDFChoice =>
   !options.upload_pdf ? "none" : options.replace_original ? "replace" : "attach";
 
+const mistralProvider = (provider: string) => provider.startsWith("mistral_ocr");
+
 /**
  * Run Options: what this OCR Run does — page limit, process mode, searchable
  * PDF handling, and a run-scoped prompt override. Options that prove
@@ -52,6 +54,7 @@ const RunOptionsPanel: React.FC<RunOptionsPanelProps> = ({
   onToast,
   onDefaultsChanged,
 }) => {
+  const mistralOCR = mistralProvider(config.provider);
   const [promptOpen, setPromptOpen] = useState(promptOverride !== null);
   const [templateLoaded, setTemplateLoaded] = useState(false);
   const [confirmReplace, setConfirmReplace] = useState(false);
@@ -213,11 +216,17 @@ const RunOptionsPanel: React.FC<RunOptionsPanelProps> = ({
               className="mt-1 block h-9 rounded-md border border-line bg-surface px-2.5 pr-8 text-sm"
             >
               <option value="image">Image per page</option>
-              <option value="pdf">PDF per page</option>
-              <option value="whole_pdf">Whole PDF at once</option>
+              <option value="pdf" disabled={mistralOCR}>
+                PDF per page
+              </option>
+              <option value="whole_pdf" disabled={mistralOCR}>
+                Whole PDF at once
+              </option>
             </select>
             <span className="mt-1 block text-xs text-faint">
-              How pages reach the model
+              {mistralOCR
+                ? "Mistral OCR only accepts page images. PDFs are not uploaded."
+                : "How pages reach the model"}
             </span>
           </label>
 

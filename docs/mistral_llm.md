@@ -31,16 +31,11 @@ environment:
 
 - Maximum file size: 50MB
 - Maximum page count: 1,000 pages
-- Supported formats: PDF, images (JPEG, PNG)
+- Supported input for `mistral_ocr`: page images (JPEG, PNG, GIF, WebP, AVIF). PDFs are refused.
 
 ## Data Retention
 
-When `OCR_PROCESS_MODE` is `pdf` or `whole_pdf`, each document (or page) is
-uploaded to Mistral's Files API before OCR. Mistral does not expire these
-uploads automatically, so paperless-gpt deletes each uploaded file right
-after the OCR call completes (also when it fails). The deletion is
-best-effort: if it fails, a warning is logged and the OCR result is not
-affected. In the default `image` mode nothing is uploaded to the Files API.
+`mistral_ocr` accepts only `OCR_PROCESS_MODE=image`. `pdf` and `whole_pdf` are refused, including a mode saved in `config/settings.json`. Page images are sent inline in the OCR request body. Nothing is uploaded to Mistral's Files API. A PDF that still reaches the provider fails as a document error, without a network call. A multi-page TIFF or a multi-frame GIF fails the document instead of silently keeping only the first page; a single-page TIFF is re-encoded as JPEG first.
 
 ## Best Practices
 

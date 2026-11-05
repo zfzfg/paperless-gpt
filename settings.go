@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"paperless-gpt/ocr"
 )
 
 const (
@@ -50,6 +53,24 @@ func (app *App) effectiveOCRDefaults() OCROptions {
 		opts.ReplaceOriginal = false
 	}
 	return opts
+}
+
+// mistralRefusesProcessMode reports when mistral_ocr is asked for a mode that
+// would send a PDF. effectiveOCRDefaults still returns a saved pdf or
+// whole_pdf value, so the config API can show it; every run and every save
+// of that mode has to call this and refuse it. The check uses the concrete
+// provider, so a test does not need the OCR_PROVIDER environment variable.
+func (app *App) mistralRefusesProcessMode(mode string) error {
+	if app == nil || app.ocrProvider == nil {
+		return nil
+	}
+	if _, ok := app.ocrProvider.(*ocr.MistralOCRProvider); !ok {
+		return nil
+	}
+	if mode == "pdf" || mode == "whole_pdf" {
+		return fmt.Errorf("mistral_ocr refuses process mode %q: files are not uploaded and page images are required", mode)
+	}
+	return nil
 }
 
 // effectiveOCROptionsForWorkflow resolves OCR run options for a workflow:

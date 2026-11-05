@@ -157,9 +157,9 @@ export async function setupTestEnvironment(config?: TestEnvironmentConfig): Prom
         OCR_PROVIDER: "mistral_ocr",
         MISTRAL_API_KEY: process.env.MISTRAL_API_KEY || '',
         MISTRAL_MODEL: "mistral-ocr-latest",
-        OCR_PROCESS_MODE: config.processMode || "whole_pdf",
+        OCR_PROCESS_MODE: config.processMode || "image",
       });
-      console.log('Configured for Mistral OCR with process mode:', config.processMode || "whole_pdf");
+      console.log('Configured for Mistral OCR with process mode:', config.processMode || "image");
     } else if (config?.ocrProvider === 'anthropic') {
       // Anthropic configuration for both OCR and classification
       Object.assign(baseEnvironment, {
