@@ -78,6 +78,19 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 	}
 	docLogger.Info("Starting OCR processing")
 
+	// Refuse a Mistral PDF mode before any prompt work or download. A saved
+	// whole_pdf setting still shows up in the config API, and this is what
+	// stops auto-OCR and workflow OCR from acting on it.
+	processMode := options.ProcessMode
+	if processMode == "" {
+		processMode = app.ocrProcessMode
+	} else if processMode != "image" && processMode != "pdf" && processMode != "whole_pdf" {
+		return nil, fmt.Errorf("invalid ProcessMode: %s, must be one of: image, pdf, whole_pdf", processMode)
+	}
+	if err := app.mistralRefusesProcessMode(processMode); err != nil {
+		return nil, err
+	}
+
 	// Render OCR prompt per-document with existing content (same pattern as title/tag/etc. prompts).
 	// A run-scoped Prompt Override takes precedence over the saved template.
 	// Use a call-scoped provider clone to avoid mutating the shared singleton.
@@ -103,24 +116,18 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 		}
 	}
 
-	// Determine the actual process mode to use
-	processMode := options.ProcessMode
-	if processMode == "" {
-		processMode = app.ocrProcessMode
-	} else if processMode != "image" && processMode != "pdf" && processMode != "whole_pdf" {
-		return nil, fmt.Errorf("invalid ProcessMode: %s, must be one of: image, pdf, whole_pdf", processMode)
-	}
-
-	// Skip OCR if PDF already has OCR
-	if app.pdfSkipExistingOCR && (processMode == "pdf" || processMode == "whole_pdf") {
-		docLogger.Infof("Checking for existing OCR in PDF document (mode: %s)...", processMode)
+	// Skip OCR when the original PDF is entirely a clear digital text layer.
+	// Images have no text layer and always continue. A download or analysis
+	// problem does not fail the document: OCR runs instead.
+	if existingTextSkipApplies(app.pdfSkipExistingOCR, processMode) {
+		docLogger.Infof("Checking the original file for a digital text layer (mode: %s)...", processMode)
 
 		document, err := app.Client.GetDocument(ctx, documentID)
 		if err != nil {
 			return nil, fmt.Errorf("error fetching document %d: %w", documentID, err)
 		}
 
-		// Skip OCR if the document already has the OCR complete tag
+		// The OCR-complete tag is a separate early return from the text-layer check.
 		if app.pdfOCRTagging {
 			for _, tag := range document.Tags {
 				if tag == app.pdfOCRCompleteTag {
@@ -133,31 +140,11 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			}
 		}
 
-		// Then check if PDF has OCR layers (if enabled and applicable mode)
-		if app.pdfSkipExistingOCR && (processMode == "pdf" || processMode == "whole_pdf") {
-			docLogger.Infof("Checking for existing OCR in PDF document (mode: %s)...", processMode)
-
-			// Download the PDF to check for OCR layers
-			_, pdfBytes, _, err := app.Client.DownloadDocumentAsPDF(ctx, documentID, 0, false)
-			if err != nil {
-				docLogger.Warnf("Failed to download PDF for OCR detection: %v, continuing with OCR process", err)
-			} else {
-				// Configure pdfocr with Strict mode
-				pdfConfig := pdfocr.DefaultConfig()
-				pdfConfig.Strict = true
-
-				// Use pdfocr to detect existing OCR
-				ocrResult, err := pdfocr.DetectOCR(pdfBytes, pdfConfig)
-				if err != nil {
-					docLogger.Warnf("OCR detection error: %v, continuing with OCR process", err)
-				} else if ocrResult.HasOCR || ocrResult.HasLayerOCR {
-					docLogger.Infof("⚠️ Skipping OCR processing - detected existing OCR layers in PDF")
-					return &ProcessedDocument{
-						ID:   documentID,
-						Text: document.Content,
-					}, nil
-				}
-			}
+		if app.originalIsClearDigitalDocument(ctx, documentID, document.Content, docLogger) {
+			return &ProcessedDocument{
+				ID:   documentID,
+				Text: document.Content,
+			}, nil
 		}
 	}
 	// Check if we have an hOCR-capable provider

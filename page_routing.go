@@ -19,6 +19,34 @@ import (
 // ocrSkipDigitalPages turns page routing on (OCR_SKIP_DIGITAL_PAGES=true).
 var ocrSkipDigitalPages = strings.EqualFold(strings.TrimSpace(os.Getenv("OCR_SKIP_DIGITAL_PAGES")), "true")
 
+// minReusableContentChars is the smallest paperless content that may replace
+// OCR. It matches clearVerdict's "no text layer" cutoff (TextChars < 30):
+// fewer non-whitespace runes means the text layer did not actually land in
+// document.Content, so OCR still runs.
+const minReusableContentChars = 30
+
+// existingTextSkipApplies reports whether PDF_SKIP_EXISTING_OCR looks at the
+// original file in this process mode. Image mode is included: a PDF is still
+// a PDF there, while a plain image has no text layer and is never skipped.
+func existingTextSkipApplies(enabled bool, mode string) bool {
+	return enabled && (mode == "image" || mode == "pdf" || mode == "whole_pdf")
+}
+
+// reusablePaperlessContent reports whether content is long enough to reuse.
+func reusablePaperlessContent(content string) bool {
+	n := 0
+	for _, r := range content {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		n++
+		if n >= minReusableContentChars {
+			return true
+		}
+	}
+	return false
+}
+
 // PageSignals are the measurements page routing decides on.
 type PageSignals struct {
 	Page               int
@@ -109,6 +137,61 @@ type pageRoute struct {
 	UseTextLayer bool
 	Text         string
 	Reason       string
+}
+
+// originalIsClearDigitalDocument reports whether OCR can be skipped for the
+// whole document. Every page of the original file must be a clear digital
+// text layer (clearVerdict, not the grey zone) and paperless content must
+// not be thin. A mixed PDF, a scanner OCR layer, a failed analysis, or a
+// file that is not a PDF returns false so OCR runs. Download and analysis
+// errors are logged and also return false; they do not fail the document.
+func (app *App) originalIsClearDigitalDocument(ctx context.Context, documentID int, content string, logger interface {
+	Infof(string, ...any)
+	Warnf(string, ...any)
+}) bool {
+	_, original, _, err := app.Client.DownloadDocumentAsPDF(ctx, documentID, 0, false)
+	if err != nil {
+		logger.Warnf("PDF_SKIP_EXISTING_OCR: could not read the original file (%v); OCR will run", err)
+		return false
+	}
+	if !isPDFData(original) {
+		logger.Infof("PDF_SKIP_EXISTING_OCR: original is not a PDF; OCR will run")
+		return false
+	}
+	doc, err := pdfrender.Open(ctx, original)
+	if err != nil {
+		logger.Warnf("PDF_SKIP_EXISTING_OCR: could not open the original PDF (%v); OCR will run", err)
+		return false
+	}
+	defer doc.Close()
+	pages := doc.NumPages()
+	if pages == 0 {
+		logger.Warnf("PDF_SKIP_EXISTING_OCR: original PDF has no pages; OCR will run")
+		return false
+	}
+	for i := 0; i < pages; i++ {
+		analysis, err := doc.AnalyzePage(i)
+		if err != nil {
+			logger.Warnf("PDF_SKIP_EXISTING_OCR: page %d could not be analyzed (%v); OCR will run", i+1, err)
+			return false
+		}
+		signals := pageSignals(i+1, analysis)
+		verdict, clear := clearVerdict(signals)
+		if !clear || verdict.NeedsOCR {
+			reason := "not a clear digital text layer"
+			if clear {
+				reason = verdict.Reason
+			}
+			logger.Infof("PDF_SKIP_EXISTING_OCR: page %d needs OCR (%s); the whole document will be OCR'd", i+1, reason)
+			return false
+		}
+	}
+	if !reusablePaperlessContent(content) {
+		logger.Infof("PDF_SKIP_EXISTING_OCR: every page is a clear digital text layer, but paperless content has fewer than %d non-whitespace characters; OCR will run", minReusableContentChars)
+		return false
+	}
+	logger.Infof("PDF_SKIP_EXISTING_OCR: skipping OCR; every page is a clear digital text layer and the existing paperless text will be reused")
+	return true
 }
 
 // planPageRouting decides, per page, whether OCR is needed. It returns nil
