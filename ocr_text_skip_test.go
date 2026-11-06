@@ -262,22 +262,23 @@ func TestSkipCheckErrorStillRunsOCR(t *testing.T) {
 	assert.NotEmpty(t, provider.pages, "a failed text-layer check must not fail the document")
 }
 
-func TestMistralRejectsPDFModesAtEveryEntry(t *testing.T) {
+func TestMistralRejectsWholePDFAtEveryEntry(t *testing.T) {
 	mistral := &App{ocrProvider: &ocr.MistralOCRProvider{}, ocrProcessMode: "image"}
 	other := &App{ocrProvider: &recordingOCRProvider{}, ocrProcessMode: "image"}
 
-	for _, mode := range []string{"pdf", "whole_pdf"} {
+	for _, mode := range []string{"whole_pdf"} {
 		err := mistral.mistralRefusesProcessMode(mode)
 		assert.Error(t, err, mode)
-		assert.Contains(t, err.Error(), "files are not uploaded")
+		assert.Contains(t, err.Error(), "use image or pdf")
 		_, err = mistral.ProcessDocumentOCR(context.Background(), 1, OCROptions{ProcessMode: mode}, "")
 		assert.Error(t, err, "a run in %s is refused before any download", mode)
 
 		assert.NoError(t, other.mistralRefusesProcessMode(mode))
 	}
 	assert.NoError(t, mistral.mistralRefusesProcessMode("image"))
+	assert.NoError(t, mistral.mistralRefusesProcessMode("pdf"))
 	assert.NoError(t, validateOCRProviderModeCompatibility("mistral_ocr", "image", ""))
-	assert.Error(t, validateOCRProviderModeCompatibility("mistral_ocr", "pdf", ""))
+	assert.NoError(t, validateOCRProviderModeCompatibility("mistral_ocr", "pdf", ""))
 	assert.Error(t, validateOCRProviderModeCompatibility("mistral_ocr", "whole_pdf", ""))
 	assert.NoError(t, validateOCRProviderModeCompatibility("docling", "whole_pdf", ""))
 

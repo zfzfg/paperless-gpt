@@ -49,11 +49,15 @@ func reusablePaperlessContent(content string) bool {
 
 // PageSignals are the measurements page routing decides on.
 type PageSignals struct {
-	Page               int
-	TextChars          int
-	Words              int
-	LetterShare        float64
-	GarbledShare       float64
+	Page         int
+	TextChars    int
+	Words        int
+	LetterShare  float64
+	GarbledShare float64
+	// GarbledChars is the unrounded count behind GarbledShare. clearVerdict
+	// tests it for zero: on a short page a single stray character rounds
+	// GarbledShare up to 0.01 and must not decide on its own.
+	GarbledChars       int
 	ImageCoverage      float64
 	InvisibleTextShare float64
 	// EncodingErrors counts spots where a font's broken encoding shows up
@@ -86,6 +90,7 @@ func pageSignals(page int, a pdfrender.PageAnalysis) PageSignals {
 		}
 	}
 	s.TextChars = visible
+	s.GarbledChars = garbled
 	s.Words = len(strings.Fields(a.Text))
 	s.EncodingErrors = countEncodingErrors(runes)
 	if visible > 0 {
@@ -117,7 +122,7 @@ func clearVerdict(s PageSignals) (v pageVerdict, ok bool) {
 		// A scanner's or another tool's OCR layer over the page image.
 		// Replacing that OCR is what paperless-gpt is for.
 		return pageVerdict{true, "OCR text layer over a scanned page"}, true
-	case s.ImageCoverage < 0.2 && s.GarbledShare == 0 && s.LetterShare >= 0.6 && s.Words >= 20:
+	case s.ImageCoverage < 0.2 && s.GarbledChars == 0 && s.LetterShare >= 0.6 && s.Words >= 20:
 		return pageVerdict{false, "digital text layer"}, true
 	}
 	return pageVerdict{}, false
@@ -139,48 +144,110 @@ type pageRoute struct {
 	Reason       string
 }
 
+// originalAnalysis is the original file of a document, downloaded once per
+// OCR run and analysed page by page. The whole-document skip, page routing
+// and pdf mode all work from it, so the original is fetched only once.
+type originalAnalysis struct {
+	// data is the original file. For an image original it is the
+	// normalised JPEG that DownloadDocumentAsPDF returns.
+	data  []byte
+	isPDF bool
+	// openErr is set when the PDF could not be opened; pages is then empty.
+	openErr error
+	pages   []analyzedPage
+}
+
+// analyzedPage is one page of the original with its routing decision.
+type analyzedPage struct {
+	signals PageSignals
+	verdict pageVerdict
+	// clear is true when clearVerdict decided the page; otherwise verdict
+	// comes from localVerdict.
+	clear bool
+	text  string
+	err   error
+}
+
+// loadOriginal downloads the original file (?original=true) and analyses
+// every page of a PDF. The error is only for a failed download; an image
+// original or a PDF that cannot be opened is reported in the result.
+func (app *App) loadOriginal(ctx context.Context, documentID int) (*originalAnalysis, error) {
+	_, data, _, err := app.Client.DownloadDocumentAsPDF(ctx, documentID, 0, false)
+	if err != nil {
+		return nil, err
+	}
+	a := &originalAnalysis{data: data, isPDF: isPDFData(data)}
+	if !a.isPDF {
+		return a, nil
+	}
+	doc, err := pdfrender.Open(ctx, data)
+	if err != nil {
+		a.openErr = err
+		return a, nil
+	}
+	defer doc.Close()
+	n := doc.NumPages()
+	a.pages = make([]analyzedPage, n)
+	for i := 0; i < n; i++ {
+		analysis, err := doc.AnalyzePage(i)
+		if err != nil {
+			a.pages[i].err = err
+			continue
+		}
+		signals := pageSignals(i+1, analysis)
+		verdict, clear := clearVerdict(signals)
+		if !clear {
+			verdict = localVerdict(signals)
+		}
+		a.pages[i] = analyzedPage{signals: signals, verdict: verdict, clear: clear, text: strings.TrimSpace(analysis.Text)}
+	}
+	return a, nil
+}
+
 // originalIsClearDigitalDocument reports whether OCR can be skipped for the
-// whole document. Every page of the original file must be a clear digital
-// text layer (clearVerdict, not the grey zone) and paperless content must
-// not be thin. A mixed PDF, a scanner OCR layer, a failed analysis, or a
-// file that is not a PDF returns false so OCR runs. Download and analysis
-// errors are logged and also return false; they do not fail the document.
+// whole document. It downloads the original; ProcessDocumentOCR uses
+// originalIsClearDigitalDocumentFrom with the analysis it already has.
 func (app *App) originalIsClearDigitalDocument(ctx context.Context, documentID int, content string, logger interface {
 	Infof(string, ...any)
 	Warnf(string, ...any)
 }) bool {
-	_, original, _, err := app.Client.DownloadDocumentAsPDF(ctx, documentID, 0, false)
-	if err != nil {
-		logger.Warnf("PDF_SKIP_EXISTING_OCR: could not read the original file (%v); OCR will run", err)
+	a, err := app.loadOriginal(ctx, documentID)
+	return originalIsClearDigitalDocumentFrom(a, err, content, logger)
+}
+
+// originalIsClearDigitalDocumentFrom decides the whole-document skip. Every
+// page of the original file must be a clear digital text layer (clearVerdict,
+// not the grey zone) and paperless content must not be thin. A mixed PDF, a
+// scanner OCR layer, a failed analysis, or a file that is not a PDF returns
+// false so OCR runs. Download and analysis errors are logged and also return
+// false; they do not fail the document.
+func originalIsClearDigitalDocumentFrom(a *originalAnalysis, loadErr error, content string, logger interface {
+	Infof(string, ...any)
+	Warnf(string, ...any)
+}) bool {
+	switch {
+	case loadErr != nil:
+		logger.Warnf("PDF_SKIP_EXISTING_OCR: could not read the original file (%v); OCR will run", loadErr)
 		return false
-	}
-	if !isPDFData(original) {
+	case !a.isPDF:
 		logger.Infof("PDF_SKIP_EXISTING_OCR: original is not a PDF; OCR will run")
 		return false
-	}
-	doc, err := pdfrender.Open(ctx, original)
-	if err != nil {
-		logger.Warnf("PDF_SKIP_EXISTING_OCR: could not open the original PDF (%v); OCR will run", err)
+	case a.openErr != nil:
+		logger.Warnf("PDF_SKIP_EXISTING_OCR: could not open the original PDF (%v); OCR will run", a.openErr)
 		return false
-	}
-	defer doc.Close()
-	pages := doc.NumPages()
-	if pages == 0 {
+	case len(a.pages) == 0:
 		logger.Warnf("PDF_SKIP_EXISTING_OCR: original PDF has no pages; OCR will run")
 		return false
 	}
-	for i := 0; i < pages; i++ {
-		analysis, err := doc.AnalyzePage(i)
-		if err != nil {
-			logger.Warnf("PDF_SKIP_EXISTING_OCR: page %d could not be analyzed (%v); OCR will run", i+1, err)
+	for i, p := range a.pages {
+		if p.err != nil {
+			logger.Warnf("PDF_SKIP_EXISTING_OCR: page %d could not be analyzed (%v); OCR will run", i+1, p.err)
 			return false
 		}
-		signals := pageSignals(i+1, analysis)
-		verdict, clear := clearVerdict(signals)
-		if !clear || verdict.NeedsOCR {
+		if !p.clear || p.verdict.NeedsOCR {
 			reason := "not a clear digital text layer"
-			if clear {
-				reason = verdict.Reason
+			if p.clear {
+				reason = p.verdict.Reason
 			}
 			logger.Infof("PDF_SKIP_EXISTING_OCR: page %d needs OCR (%s); the whole document will be OCR'd", i+1, reason)
 			return false
@@ -194,12 +261,8 @@ func (app *App) originalIsClearDigitalDocument(ctx context.Context, documentID i
 	return true
 }
 
-// planPageRouting decides, per page, whether OCR is needed. It returns nil
-// (OCR every page) when routing is off, the original is not a PDF, or
-// anything goes wrong: routing only ever saves work, it never blocks OCR.
-// pages is the number of pages to process, totalPages the archive version's
-// page count; the original must have exactly as many pages, or page i of the
-// original might not be page i of the archive.
+// planPageRouting decides, per page, whether OCR is needed. It downloads the
+// original; ProcessDocumentOCR uses planPageRoutingFrom instead.
 func (app *App) planPageRouting(ctx context.Context, documentID, pages, totalPages int, logger interface {
 	Infof(string, ...any)
 	Warnf(string, ...any)
@@ -207,42 +270,50 @@ func (app *App) planPageRouting(ctx context.Context, documentID, pages, totalPag
 	if !ocrSkipDigitalPages {
 		return nil
 	}
-	_, original, _, err := app.Client.DownloadDocumentAsPDF(ctx, documentID, 0, false)
-	if err != nil || !isPDFData(original) {
-		if err != nil {
-			logger.Warnf("Page routing skipped: could not read the original file: %v", err)
-		}
+	a, err := app.loadOriginal(ctx, documentID)
+	return planPageRoutingFrom(a, err, pages, totalPages, logger)
+}
+
+// planPageRoutingFrom returns nil (OCR every page) when routing is off, the
+// original is not a PDF, or anything goes wrong: routing only ever saves
+// work, it never blocks OCR. pages is the number of pages to process,
+// totalPages the page count of the file that is OCRed (the archive version
+// in image mode, the original in pdf mode); the original must have exactly
+// as many pages, or page i of the original might not be page i of that file.
+func planPageRoutingFrom(a *originalAnalysis, loadErr error, pages, totalPages int, logger interface {
+	Infof(string, ...any)
+	Warnf(string, ...any)
+}) []pageRoute {
+	if !ocrSkipDigitalPages {
 		return nil
 	}
-	doc, err := pdfrender.Open(ctx, original)
-	if err != nil {
-		logger.Warnf("Page routing skipped: could not open the original PDF: %v", err)
+	switch {
+	case loadErr != nil:
+		logger.Warnf("Page routing skipped: could not read the original file: %v", loadErr)
 		return nil
-	}
-	defer doc.Close()
-	if doc.NumPages() != totalPages || pages > totalPages {
-		logger.Warnf("Page routing skipped: the original has %d pages, the archive version %d", doc.NumPages(), totalPages)
+	case !a.isPDF:
+		return nil
+	case a.openErr != nil:
+		logger.Warnf("Page routing skipped: could not open the original PDF: %v", a.openErr)
+		return nil
+	case len(a.pages) != totalPages || pages > totalPages:
+		logger.Warnf("Page routing skipped: the original has %d pages, the file to OCR %d", len(a.pages), totalPages)
 		return nil
 	}
 
 	routes := make([]pageRoute, pages)
 	skipped := 0
 	for i := 0; i < pages; i++ {
-		analysis, err := doc.AnalyzePage(i)
-		if err != nil {
-			logger.Warnf("Page routing: OCR for page %d, it could not be analyzed: %v", i+1, err)
-			continue
-		}
-		signals := pageSignals(i+1, analysis)
-		verdict, clear := clearVerdict(signals)
-		if !clear {
-			verdict = localVerdict(signals)
-		}
-		if !verdict.NeedsOCR {
-			routes[i] = pageRoute{UseTextLayer: true, Text: strings.TrimSpace(analysis.Text), Reason: verdict.Reason}
+		p := a.pages[i]
+		switch {
+		case p.err != nil:
+			logger.Warnf("Page routing: OCR for page %d, it could not be analyzed: %v", i+1, p.err)
+			routes[i] = pageRoute{Reason: "page could not be analyzed"}
+		case !p.verdict.NeedsOCR:
+			routes[i] = pageRoute{UseTextLayer: true, Text: p.text, Reason: p.verdict.Reason}
 			skipped++
-		} else {
-			routes[i] = pageRoute{Reason: verdict.Reason}
+		default:
+			routes[i] = pageRoute{Reason: p.verdict.Reason}
 		}
 	}
 	logger.Infof("Page routing: %d of %d pages read from their text layer, %d sent to OCR", skipped, pages, pages-skipped)

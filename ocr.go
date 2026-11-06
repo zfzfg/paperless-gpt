@@ -116,6 +116,21 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 		}
 	}
 
+	// The original file is downloaded and analysed at most once per run and
+	// shared by the whole-document skip, page routing and pdf mode.
+	var (
+		original       *originalAnalysis
+		originalErr    error
+		originalLoaded bool
+	)
+	getOriginal := func() (*originalAnalysis, error) {
+		if !originalLoaded {
+			original, originalErr = app.loadOriginal(ctx, documentID)
+			originalLoaded = true
+		}
+		return original, originalErr
+	}
+
 	// Skip OCR when the original PDF is entirely a clear digital text layer.
 	// Images have no text layer and always continue. A download or analysis
 	// problem does not fail the document: OCR runs instead.
@@ -140,7 +155,7 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			}
 		}
 
-		if app.originalIsClearDigitalDocument(ctx, documentID, document.Content, docLogger) {
+		if orig, err := getOriginal(); originalIsClearDigitalDocumentFrom(orig, err, document.Content, docLogger) {
 			return &ProcessedDocument{
 				ID:   documentID,
 				Text: document.Content,
@@ -236,22 +251,30 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			jobStore.updatePagesDone(jobID, totalPdfPages)
 		}
 	} else if processMode == "pdf" {
-		// Process PDF pages individually
-		pdfPaths, pdfData, pdfPageCount, err := app.Client.DownloadDocumentAsPDF(ctx, documentID, pageLimit, true)
-		defer func() {
-			for _, pdfPath := range pdfPaths {
-				if err := os.Remove(pdfPath); err != nil {
-					docLogger.WithError(err).WithField("pdf_path", pdfPath).Warn("Failed to remove temporary PDF file")
-				}
-			}
-		}()
-		if err != nil {
-			return nil, fmt.Errorf("error downloading document PDFs for document %d: %w", documentID, err)
+		// Process PDF pages individually. The original is downloaded once
+		// and analysed first; only the pages that need OCR are cut out as
+		// one-page PDFs, the others keep their own text layer. Nothing is
+		// rendered in this mode.
+		orig, loadErr := getOriginal()
+		if loadErr != nil {
+			return nil, fmt.Errorf("error downloading document PDF for document %d: %w", documentID, loadErr)
 		}
-
-		// Store the original PDF data
-		originalPDFData = pdfData
-		totalPdfPages = pdfPageCount
+		originalPDFData = orig.data
+		if orig.isPDF {
+			if orig.openErr != nil {
+				return nil, fmt.Errorf("error opening document PDF for document %d: %w", documentID, orig.openErr)
+			}
+			totalPdfPages = len(orig.pages)
+		} else {
+			// An image original (DownloadDocumentAsPDF returns it as JPEG)
+			// is one page and goes to the provider as an image.
+			docLogger.Info("Original is an image, not a PDF; processing it as a single page")
+			totalPdfPages = 1
+		}
+		pagesToProcess := totalPdfPages
+		if pageLimit > 0 && pageLimit < totalPdfPages {
+			pagesToProcess = pageLimit
+		}
 
 		if jobID != "" {
 			jobStore.Lock()
@@ -261,40 +284,50 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			jobStore.Unlock()
 		}
 
-		// Log the page count information
-		docLogger.WithFields(logrus.Fields{
-			"processed_page_count": len(pdfPaths),
-			"total_page_count":     totalPdfPages,
-			"limit_pages":          pageLimit,
-		}).Debug("Downloaded document PDFs")
+		var routes []pageRoute
+		if options.UploadPDF || app.createLocalHOCR || app.createLocalPDF || hasHOCR {
+			if ocrSkipDigitalPages {
+				docLogger.Info("Page routing is off for this run: a searchable PDF or hOCR needs OCR on every page")
+			}
+		} else if orig.isPDF {
+			// Routing and OCR use the same file here, so the page counts match.
+			routes = planPageRoutingFrom(orig, nil, pagesToProcess, totalPdfPages, docLogger)
+		}
 
-		for i, pdfPath := range pdfPaths {
+		var resumedPages map[int]string
+		if options.ResumeFailedRun && !options.UploadPDF && !app.createLocalHOCR && !app.createLocalPDF && !hasHOCR {
+			resumedPages = resumableOCRPages(app.Database, documentID, jobID, processMode)
+		}
+
+		var counts pageSourceCounts
+		for i := 0; i < pagesToProcess; i++ {
+			select {
+			case <-ctx.Done():
+				docLogger.Info("Job cancelled before processing page")
+				return &ProcessedDocument{
+					ID:   documentID,
+					Text: strings.Join(ocrTexts, "\n\n"),
+				}, ctx.Err()
+			default:
+			}
+
 			pageLogger := docLogger.WithField("page", i+1)
-			pageLogger.Debug("Processing page")
-
-			pdfContent, err := os.ReadFile(pdfPath)
+			page := i + 1
+			payload := func() ([]byte, error) {
+				if !orig.isPDF {
+					return orig.data, nil
+				}
+				return extractPDFPage(orig.data, page)
+			}
+			result, err := ocrPageOrUseRoute(ctx, provider, i, resumedPages, routes, payload, pageLogger, &counts)
 			if err != nil {
-				return nil, fmt.Errorf("error reading PDF file for document %d, page %d: %w", documentID, i+1, err)
+				return nil, fmt.Errorf("error performing OCR for document %d, page %d: %w", documentID, page, err)
 			}
-
-			// Pass the page number (1-based index) to ProcessImage
-			result, err := provider.ProcessImage(ctx, pdfContent, i+1)
-			if err != nil {
-				return nil, fmt.Errorf("error performing OCR for document %d, page %d: %w", documentID, i+1, err)
-			}
-			if result == nil {
-				pageLogger.Error("Got nil result from OCR provider")
-				return nil, fmt.Errorf("error performing OCR for document %d, page %d: nil result", documentID, i+1)
-			}
-
-			pageLogger.WithField("has_hocr_page", result.HOCRPage != nil).
-				WithField("metadata", result.Metadata).
-				Debug("OCR completed for page")
 
 			ocrTexts = append(ocrTexts, result.Text)
 
 			if jobID != "" {
-				jobStore.updatePagesDone(jobID, i+1)
+				jobStore.updatePagesDone(jobID, page)
 			}
 
 			var genInfoJSON string
@@ -307,6 +340,7 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 				pageLogger.WithError(saveErr).Error("Failed to save OCR page result to database")
 			}
 		}
+		counts.log(docLogger, pagesToProcess, ocrProviderLabel(), processMode)
 	} else {
 		// Process pages as images
 		// Assign, don't declare: the searchable PDF check after this branch
@@ -352,7 +386,10 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 				docLogger.Info("Page routing is off for this run: a searchable PDF or hOCR needs OCR on every page")
 			}
 		} else {
-			routes = app.planPageRouting(ctx, documentID, len(imagePaths), totalPdfPages, docLogger)
+			if ocrSkipDigitalPages {
+				orig, err := getOriginal()
+				routes = planPageRoutingFrom(orig, err, len(imagePaths), totalPdfPages, docLogger)
+			}
 		}
 
 		var resumedPages map[int]string
@@ -360,6 +397,7 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			resumedPages = resumableOCRPages(app.Database, documentID, jobID, processMode)
 		}
 
+		var imageCounts pageSourceCounts
 		for i, imagePath := range imagePaths {
 			select {
 			case <-ctx.Done():
@@ -383,35 +421,14 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			// Store image data for potential PDF generation
 			imageDataList = append(imageDataList, imageContent)
 
-			var result *ocr.OCRResult
-			if text, resumed := resumedPages[i]; resumed {
-				pageLogger.Info("Reusing the page from the failed previous run")
-				result = &ocr.OCRResult{Text: text, Metadata: map[string]string{"provider": "resumed"}}
-			} else if i < len(routes) && routes[i].UseTextLayer {
-				pageLogger.Infof("Using the page's own text layer instead of OCR (%s)", routes[i].Reason)
-				result = &ocr.OCRResult{
-					Text:     routes[i].Text,
-					Metadata: map[string]string{"provider": "text-layer", "page_routing": routes[i].Reason},
-				}
-			} else {
-				// Pass the page number (1-based index) to ProcessImage
-				result, err = provider.ProcessImage(ctx, imageContent, i+1)
-				if err != nil {
-					return nil, fmt.Errorf("error performing OCR for document %d, page %d: %w", documentID, i+1, err)
-				}
-			}
-			if result == nil {
-				pageLogger.Error("Got nil result from OCR provider")
-				return nil, fmt.Errorf("error performing OCR for document %d, page %d: nil result", documentID, i+1)
+			result, err := ocrPageOrUseRoute(ctx, provider, i, resumedPages, routes, func() ([]byte, error) { return imageContent, nil }, pageLogger, &imageCounts)
+			if err != nil {
+				return nil, fmt.Errorf("error performing OCR for document %d, page %d: %w", documentID, i+1, err)
 			}
 
 			if jobID != "" {
 				jobStore.updatePagesDone(jobID, i+1)
 			}
-
-			pageLogger.WithField("has_hocr_page", result.HOCRPage != nil).
-				WithField("metadata", result.Metadata).
-				Debug("OCR completed for page")
 
 			ocrTexts = append(ocrTexts, result.Text)
 			ocrResults = append(ocrResults, result)
@@ -429,6 +446,7 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 				// Continue processing other pages even if saving fails for one
 			}
 		}
+		imageCounts.log(docLogger, len(imagePaths), ocrProviderLabel(), processMode)
 	}
 
 	fullText := strings.Join(ocrTexts, "\n\n")
@@ -876,4 +894,54 @@ func taskResultDetail(task map[string]interface{}) interface{} {
 		}
 	}
 	return "no detail from paperless-ngx"
+}
+
+// pageSourceCounts counts where each page's text came from in one run.
+type pageSourceCounts struct {
+	textLayer, provider, resumed int
+}
+
+// log writes the per-document summary, so the log can be checked against
+// the provider's usage page: "provider" is the number of OCR requests sent.
+func (c pageSourceCounts) log(logger *logrus.Entry, pages int, providerName, mode string) {
+	logger.Infof("OCR summary: %d pages, %d from text layer, %d sent to %s (mode %s), %d resumed",
+		pages, c.textLayer, c.provider, providerName, mode, c.resumed)
+}
+
+// ocrPageOrUseRoute produces the text of one page (0-based index i): from a
+// failed earlier run, from the page's own text layer, or from the provider.
+// payload is only called when the provider is needed, so a page that keeps
+// its text layer is never rendered or cut out.
+func ocrPageOrUseRoute(ctx context.Context, provider ocr.Provider, i int, resumed map[int]string, routes []pageRoute, payload func() ([]byte, error), pageLogger *logrus.Entry, counts *pageSourceCounts) (*ocr.OCRResult, error) {
+	if text, ok := resumed[i]; ok {
+		pageLogger.Info("Reusing the page from the failed previous run")
+		counts.resumed++
+		return &ocr.OCRResult{Text: text, Metadata: map[string]string{"provider": "resumed"}}, nil
+	}
+	if i < len(routes) && routes[i].UseTextLayer {
+		pageLogger.Infof("Using the page's own text layer instead of OCR (%s)", routes[i].Reason)
+		counts.textLayer++
+		return &ocr.OCRResult{
+			Text:     routes[i].Text,
+			Metadata: map[string]string{"provider": "text-layer", "page_routing": routes[i].Reason},
+		}, nil
+	}
+	data, err := payload()
+	if err != nil {
+		return nil, err
+	}
+	counts.provider++
+	// Pass the page number (1-based index) to ProcessImage
+	result, err := provider.ProcessImage(ctx, data, i+1)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		pageLogger.Error("Got nil result from OCR provider")
+		return nil, fmt.Errorf("nil result")
+	}
+	pageLogger.WithField("has_hocr_page", result.HOCRPage != nil).
+		WithField("metadata", result.Metadata).
+		Debug("OCR completed for page")
+	return result, nil
 }

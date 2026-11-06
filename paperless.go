@@ -2064,7 +2064,21 @@ func (client *PaperlessClient) DownloadDocumentAsImages(ctx context.Context, doc
 var (
 	pdfTrimFile  = api.TrimFile
 	pdfSplitFile = api.SplitFile
+	pdfTrim      = api.Trim
 )
+
+// extractPDFPage returns page (1-based) of a PDF as a one-page PDF, in
+// memory. pdf mode uses it to cut out only the pages that need OCR.
+func extractPDFPage(pdfData []byte, page int) ([]byte, error) {
+	var out bytes.Buffer
+	err := recoverPdfcpuPanic("trim", func() error {
+		return pdfTrim(bytes.NewReader(pdfData), &out, []string{strconv.Itoa(page)}, nil)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error extracting page %d: %w", page, err)
+	}
+	return out.Bytes(), nil
+}
 
 // recoverPdfcpuPanic runs a pdfcpu operation and turns a panic into an error.
 // pdfcpu can panic on malformed PDFs (#1203). Without this the whole process

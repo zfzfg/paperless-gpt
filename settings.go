@@ -55,9 +55,10 @@ func (app *App) effectiveOCRDefaults() OCROptions {
 	return opts
 }
 
-// mistralRefusesProcessMode reports when mistral_ocr is asked for a mode that
-// would send a PDF. effectiveOCRDefaults still returns a saved pdf or
-// whole_pdf value, so the config API can show it; every run and every save
+// mistralRefusesProcessMode reports when mistral_ocr is asked for whole_pdf.
+// image and pdf send pages inline; whole_pdf would send the whole document
+// past page routing. effectiveOCRDefaults still returns a saved whole_pdf
+// value, so the config API can show it; every run and every save
 // of that mode has to call this and refuse it. The check uses the concrete
 // provider, so a test does not need the OCR_PROVIDER environment variable.
 func (app *App) mistralRefusesProcessMode(mode string) error {
@@ -67,8 +68,8 @@ func (app *App) mistralRefusesProcessMode(mode string) error {
 	if _, ok := app.ocrProvider.(*ocr.MistralOCRProvider); !ok {
 		return nil
 	}
-	if mode == "pdf" || mode == "whole_pdf" {
-		return fmt.Errorf("mistral_ocr refuses process mode %q: files are not uploaded and page images are required", mode)
+	if mode == "whole_pdf" {
+		return fmt.Errorf("mistral_ocr refuses process mode %q: use image or pdf, which send only the pages that need OCR, inline", mode)
 	}
 	return nil
 }

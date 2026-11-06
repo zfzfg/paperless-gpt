@@ -44,6 +44,8 @@ type Config struct {
 	MistralModel        string // Optional, defaults to "mistral-ocr-latest"
 	MistralImageLimit   *int   // Optional, max images extracted per document
 	MistralImageMinSize *int   // Optional, min height/width (px) for a region to be extracted as an image rather than transcribed
+	// MistralMaxInlineBytes caps a PDF sent inline (0 = DefaultMistralMaxInlineBytes).
+	MistralMaxInlineBytes int
 
 	// Generic Vision LLM settings
 	VisionLLMMaxTokens   int

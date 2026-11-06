@@ -11,6 +11,7 @@ import (
 	"image"
 	"image/draw"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -176,6 +177,18 @@ type PageAnalysis struct {
 	InvisibleTextObjects int
 }
 
+// pdfiumTextMarkers removes PDFium's in-band text markers. PDFium reports
+// a soft hyphen (a possible break inside a word, "ver\x02längert") as
+// U+0002, and some PDFs carry U+FFFE for the same thing. Neither is a broken
+// character: they are dropped so the word reads as it is printed, and so
+// they do not reach the document content as control characters.
+var pdfiumTextMarkers = strings.NewReplacer("\u0002", "", "\uFFFE", "")
+
+// NormalizePageText replaces PDFium's text markers in extracted page text.
+func NormalizePageText(s string) string {
+	return pdfiumTextMarkers.Replace(s)
+}
+
 // AnalyzePage returns the text and the image/text make-up of a page (0-based).
 func (d *Document) AnalyzePage(index int) (PageAnalysis, error) {
 	page, err := d.page(index)
@@ -187,7 +200,7 @@ func (d *Document) AnalyzePage(index int) (PageAnalysis, error) {
 	if err != nil {
 		return PageAnalysis{}, fmt.Errorf("reading text of page %d: %w", index+1, err)
 	}
-	a.Text = text.Text
+	a.Text = NormalizePageText(text.Text)
 
 	width, height, err := d.PageSize(index)
 	if err != nil {

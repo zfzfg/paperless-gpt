@@ -27,9 +27,11 @@ var (
 	// mistralRetryBaseDelay is the first wait before an OCR request is retried.
 	mistralRetryBaseDelay = 2 * time.Second
 
-	// errMistralRefusesPDF is a document error. It is not an HTTPStatusError,
-	// so the outage retry path does not treat it as a provider failure.
-	errMistralRefusesPDF = errors.New("mistral_ocr refuses PDF bytes: files are not uploaded and page images are required")
+	// errMistralPDFTooLarge is a document error. It is not an HTTPStatusError,
+	// so the outage retry path does not treat it as a provider failure. There
+	// is deliberately no fallback: a PDF is never uploaded to the Files API,
+	// which Mistral keeps outside Zero Data Retention.
+	errMistralPDFTooLarge = errors.New("mistral_ocr refuses the PDF: it is larger than MISTRAL_OCR_MAX_INLINE_BYTES and files are never uploaded")
 
 	// mistralImagePlaceholder matches the links Mistral OCR writes for extracted
 	// images, e.g. ![img-0.jpeg](img-0.jpeg). The images themselves are not kept.
@@ -39,6 +41,10 @@ var (
 const (
 	mistralMaxRetries    = 5
 	mistralMaxRetryDelay = time.Minute
+
+	// DefaultMistralMaxInlineBytes caps a PDF sent inline as base64. In pdf
+	// mode a request carries one page, so this is far above normal use.
+	DefaultMistralMaxInlineBytes = 20 << 20
 )
 
 // HTTPStatusError is a provider answering with an error status. It keeps the
@@ -57,10 +63,11 @@ func (e *HTTPStatusError) RetryAfter() time.Duration { return e.After }
 
 // MistralOCRProvider implements the OCR Provider interface using Mistral's OCR API
 type MistralOCRProvider struct {
-	apiKey       string
-	model        string
-	imageLimit   *int
-	imageMinSize *int
+	apiKey         string
+	model          string
+	imageLimit     *int
+	imageMinSize   *int
+	maxInlineBytes int
 }
 
 // MistralOCRRequest represents the request body for the Mistral OCR API
@@ -119,8 +126,9 @@ func newMistralOCRProvider(config Config) (Provider, error) {
 			}
 			return config.MistralModel
 		}(),
-		imageLimit:   config.MistralImageLimit,
-		imageMinSize: config.MistralImageMinSize,
+		imageLimit:     config.MistralImageLimit,
+		imageMinSize:   config.MistralImageMinSize,
+		maxInlineBytes: config.MistralMaxInlineBytes,
 	}, nil
 }
 
@@ -144,29 +152,40 @@ func (p *MistralOCRProvider) ProcessImage(ctx context.Context, data []byte, page
 	req.ImageLimit = p.imageLimit
 	req.ImageMinSize = p.imageMinSize
 
-	// A PDF must not reach the network. pdf and whole_pdf are rejected before
-	// this, and a PDF that still arrives is a document failure, not an outage.
-	if mistralPayloadIsPDF(data, mtype.String()) {
-		logger.Error(errMistralRefusesPDF.Error())
-		return nil, errMistralRefusesPDF
-	}
-	if _, ok := mistralInlineImageTypes[mtype.String()]; !ok {
-		err := fmt.Errorf("mistral_ocr refuses content type %q: files are not uploaded and page images are required", mtype.String())
+	// Everything goes inline in the /v1/ocr request body, which Mistral
+	// covers by Zero Data Retention. Nothing is uploaded to the Files API.
+	mimeType := mtype.String()
+	if mistralPayloadIsPDF(data, mimeType) {
+		mimeType = "application/pdf"
+		limit := p.maxInlineBytes
+		if limit <= 0 {
+			limit = DefaultMistralMaxInlineBytes
+		}
+		if len(data) > limit {
+			err := fmt.Errorf("%w (%d bytes, limit %d)", errMistralPDFTooLarge, len(data), limit)
+			logger.Error(err.Error())
+			return nil, err
+		}
+	} else if _, ok := mistralInlineImageTypes[mimeType]; !ok {
+		err := fmt.Errorf("mistral_ocr refuses content type %q: only PDFs and page images are sent, inline, and files are never uploaded", mimeType)
 		logger.Error(err.Error())
 		return nil, err
 	}
 
-	logger.Debug("Processing image content via base64 method")
 	base64Data := base64.StdEncoding.EncodeToString(data)
-	dataURL := fmt.Sprintf("data:%s;base64,%s", mtype.String(), base64Data)
-
-	req.Document.Type = "image_url"
-	req.Document.ImageURL = dataURL
+	dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64Data)
+	if mimeType == "application/pdf" {
+		req.Document.Type = "document_url"
+		req.Document.DocumentURL = dataURL
+	} else {
+		req.Document.Type = "image_url"
+		req.Document.ImageURL = dataURL
+	}
 	logger.WithFields(logrus.Fields{
-		"mime_type":       mtype.String(),
-		"base64_length":   len(base64Data),
-		"data_url_prefix": dataURL[:min(50, len(dataURL))],
-	}).Debug("Using image URL method")
+		"mime_type":     mimeType,
+		"document_type": req.Document.Type,
+		"base64_length": len(base64Data),
+	}).Debug("Sending the document inline")
 
 	text, err := p.processDocument(ctx, req, logger)
 	if err != nil {
@@ -178,7 +197,7 @@ func (p *MistralOCRProvider) ProcessImage(ctx context.Context, data []byte, page
 		Metadata: map[string]string{
 			"provider":  "mistral_ocr",
 			"model":     p.model,
-			"mime_type": mtype.String(),
+			"mime_type": mimeType,
 			"page":      fmt.Sprintf("%d", pageNumber),
 		},
 	}, nil

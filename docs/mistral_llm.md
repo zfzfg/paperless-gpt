@@ -31,11 +31,11 @@ environment:
 
 - Maximum file size: 50MB
 - Maximum page count: 1,000 pages
-- Supported input for `mistral_ocr`: page images (JPEG, PNG, GIF, WebP, AVIF). PDFs are refused.
+- Supported input for `mistral_ocr`: page images (JPEG, PNG, GIF, WebP, AVIF) and PDFs, both inline. A PDF over `MISTRAL_OCR_MAX_INLINE_BYTES` (default 20 MB) fails the document.
 
 ## Data Retention
 
-`mistral_ocr` accepts only `OCR_PROCESS_MODE=image`. `pdf` and `whole_pdf` are refused, including a mode saved in `config/settings.json`. Page images are sent inline in the OCR request body. Nothing is uploaded to Mistral's Files API. A PDF that still reaches the provider fails as a document error, without a network call. A multi-page TIFF or a multi-frame GIF fails the document instead of silently keeping only the first page; a single-page TIFF is re-encoded as JPEG first.
+`mistral_ocr` accepts `OCR_PROCESS_MODE=image` and `pdf`. `whole_pdf` is refused, including a mode saved in `config/settings.json`, because it would send the whole document past page routing. Everything is sent inline in the `/v1/ocr` request body: page images as `image_url`, PDFs as `document_url` with a `data:application/pdf;base64,` URL. Nothing is uploaded to Mistral's Files API, which Mistral keeps outside Zero Data Retention; there is no upload fallback, and a test keeps `v1/files` out of the provider. In `pdf` mode only the pages that need OCR are cut out of the original as one-page PDFs; pages with a usable text layer keep it (`OCR_SKIP_DIGITAL_PAGES`), and nothing is rendered. A multi-page TIFF or a multi-frame GIF fails the document instead of silently keeping only the first page; a single-page TIFF is re-encoded as JPEG first.
 
 ## Best Practices
 

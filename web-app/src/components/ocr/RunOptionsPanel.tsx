@@ -216,7 +216,7 @@ const RunOptionsPanel: React.FC<RunOptionsPanelProps> = ({
               className="mt-1 block h-9 rounded-md border border-line bg-surface px-2.5 pr-8 text-sm"
             >
               <option value="image">Image per page</option>
-              <option value="pdf" disabled={mistralOCR}>
+              <option value="pdf">
                 PDF per page
               </option>
               <option value="whole_pdf" disabled={mistralOCR}>
@@ -225,7 +225,7 @@ const RunOptionsPanel: React.FC<RunOptionsPanelProps> = ({
             </select>
             <span className="mt-1 block text-xs text-faint">
               {mistralOCR
-                ? "Mistral OCR only accepts page images. PDFs are not uploaded."
+                ? "Mistral OCR: image or PDF per page, sent inline. Files are never uploaded."
                 : "How pages reach the model"}
             </span>
           </label>

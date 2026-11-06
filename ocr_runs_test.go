@@ -350,10 +350,10 @@ func TestMistralHTTPRejectsPDFModes(t *testing.T) {
 		return w
 	}
 
-	for _, mode := range []string{"pdf", "whole_pdf"} {
+	for _, mode := range []string{"whole_pdf"} {
 		w := post(`{"process_mode":"` + mode + `"}`)
 		assert.Equal(t, http.StatusBadRequest, w.Code, mode)
-		assert.Contains(t, w.Body.String(), "page images are required")
+		assert.Contains(t, w.Body.String(), "use image or pdf")
 
 		w = put(`{"process_mode":"` + mode + `"}`)
 		assert.Equal(t, http.StatusBadRequest, w.Code, "save "+mode)

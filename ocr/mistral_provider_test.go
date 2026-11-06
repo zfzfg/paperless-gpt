@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -70,7 +71,7 @@ func setupTestServerWithState() (*httptest.Server, *testServerState, func()) {
 }
 
 // minimalPDF returns bytes that mimetype.Detect identifies as application/pdf,
-// so ProcessImage takes the file-upload branch.
+// so ProcessImage takes the inline document_url branch.
 func minimalPDF() []byte {
 	return []byte("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF")
 }
@@ -235,29 +236,74 @@ func TestMistralOCRProvider_ProcessImage(t *testing.T) {
 	assert.Empty(t, state.filesCalls)
 }
 
-func TestMistralOCRProvider_ProcessImage_RefusesPDFWithoutNetwork(t *testing.T) {
+func TestMistralOCRProvider_ProcessImage_SendsPDFInline(t *testing.T) {
+	_, state, cleanup := setupTestServerWithState()
+	defer cleanup()
+	provider := &MistralOCRProvider{apiKey: "test-key", model: "mistral-ocr-latest"}
+
+	result, err := provider.ProcessImage(context.Background(), minimalPDF(), 1)
+
+	assert.NoError(t, err)
+	assert.Equal(t, "Test OCR output", result.Text)
+	assert.Equal(t, "application/pdf", result.Metadata["mime_type"])
+	var body MistralOCRRequest
+	assert.NoError(t, json.Unmarshal([]byte(state.lastOCRBody), &body))
+	assert.Equal(t, "document_url", body.Document.Type)
+	assert.True(t, strings.HasPrefix(body.Document.DocumentURL, "data:application/pdf;base64,"), "the PDF travels inline, not as a link to an upload")
+	assert.Empty(t, body.Document.ImageURL)
+	assert.Empty(t, state.filesCalls)
+}
+
+func TestMistralOCRProvider_ProcessImage_RefusesLargePDFWithoutNetwork(t *testing.T) {
 	called := false
 	origClient := mistralHTTPClient
 	mistralHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		called = true
-		if strings.Contains(r.URL.Path, "/v1/files") {
-			t.Errorf("files API was called: %s %s", r.Method, r.URL)
-		}
-		t.Errorf("network call from a refused PDF: %s %s", r.Method, r.URL)
+		t.Errorf("network call for a PDF over the inline limit: %s %s", r.Method, r.URL)
 		return nil, errors.New("network disabled")
 	})}
 	t.Cleanup(func() { mistralHTTPClient = origClient })
 
-	provider := &MistralOCRProvider{apiKey: "test-key", model: "mistral-ocr-latest"}
-	result, err := provider.ProcessImage(context.Background(), minimalPDF(), 1)
+	pdf := minimalPDF()
+	provider := &MistralOCRProvider{apiKey: "test-key", model: "mistral-ocr-latest", maxInlineBytes: len(pdf) - 1}
+	result, err := provider.ProcessImage(context.Background(), pdf, 1)
 
 	assert.Nil(t, result)
-	assert.ErrorIs(t, err, errMistralRefusesPDF)
-	assert.Contains(t, err.Error(), "files are not uploaded")
-	assert.Contains(t, err.Error(), "page images are required")
+	assert.ErrorIs(t, err, errMistralPDFTooLarge)
+	assert.Contains(t, err.Error(), "never uploaded")
 	var status *HTTPStatusError
-	assert.False(t, errors.As(err, &status), "a refused PDF is a document error, not a provider outage")
+	assert.False(t, errors.As(err, &status), "an oversized PDF is a document error, not a provider outage")
 	assert.False(t, called)
+}
+
+// TestMistralOCRProvider_OnlyOCREndpoint is the Zero Data Retention guard:
+// whatever the payload, the provider talks to /v1/ocr and nothing else.
+func TestMistralOCRProvider_OnlyOCREndpoint(t *testing.T) {
+	var paths []string
+	origClient := mistralHTTPClient
+	mistralHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		rec := httptest.NewRecorder()
+		handleOCRRequest(rec, r)
+		return rec.Result(), nil
+	})}
+	t.Cleanup(func() { mistralHTTPClient = origClient })
+
+	provider := &MistralOCRProvider{apiKey: "test-key", model: "mistral-ocr-latest"}
+	for _, payload := range [][]byte{onePixelJPEG(t), minimalPDF()} {
+		_, err := provider.ProcessImage(context.Background(), payload, 1)
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, []string{"/v1/ocr", "/v1/ocr"}, paths)
+}
+
+// TestMistralProviderSourceHasNoFilesAPI keeps the Files API out of the
+// production code, so a later merge cannot bring the upload path back.
+func TestMistralProviderSourceHasNoFilesAPI(t *testing.T) {
+	src, err := os.ReadFile("mistral_provider.go")
+	assert.NoError(t, err)
+	assert.NotContains(t, string(src), "v1/files")
+	assert.NotContains(t, strings.ToLower(string(src)), "signed_url")
 }
 
 func TestMistralOCRProvider_FilesAPIStaysUnused(t *testing.T) {

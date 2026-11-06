@@ -373,6 +373,15 @@ func main() {
 		}
 	}
 
+	var mistralMaxInlineBytes int
+	if raw := os.Getenv("MISTRAL_OCR_MAX_INLINE_BYTES"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			mistralMaxInlineBytes = parsed
+		} else {
+			log.Warnf("Invalid MISTRAL_OCR_MAX_INLINE_BYTES value %q: must be a positive number of bytes, using the default", raw)
+		}
+	}
+
 	if val, ok := os.LookupEnv("GOOGLEAI_THINKING_BUDGET"); ok {
 		if v, err := strconv.ParseInt(val, 10, 32); err == nil {
 			if v >= math.MinInt32 && v <= math.MaxInt32 {
@@ -400,6 +409,7 @@ func main() {
 		MistralModel:             os.Getenv("MISTRAL_MODEL"),
 		MistralImageLimit:        mistralImageLimit,
 		MistralImageMinSize:      mistralImageMinSize,
+		MistralMaxInlineBytes:    mistralMaxInlineBytes,
 		DoclingURL:               doclingURL,
 		DoclingImageExportMode:   doclingImageExportMode,
 		DoclingOCRPipeline:       doclingOCRPipeline,
@@ -771,7 +781,7 @@ func validateOCRProviderModeCompatibility(provider, mode, visionProvider string)
 		"llm":          {"image"},                     // LLM-based OCR only supports image mode (except googleai)
 		"azure":        {"image"},                     // Azure Document Intelligence only supports image mode
 		"google_docai": {"image", "pdf", "whole_pdf"}, // Google Document AI supports all modes
-		"mistral_ocr":  {"image"},                     // PDFs would be uploaded; only page images are allowed
+		"mistral_ocr":  {"image", "pdf"},              // inline only, never the Files API; whole_pdf skips page routing
 		"docling":      {"image", "pdf", "whole_pdf"}, // Docling supports image and PDF modes
 	}
 
